@@ -9,39 +9,168 @@ import {
 } from '@tailwindcss/node'
 import { clearRequireCache } from '@tailwindcss/node/require-cache'
 import { Scanner } from '@tailwindcss/oxide'
+import { realpathSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { Plugin, ResolvedConfig, ViteDevServer } from 'vite'
+import type {
+  Environment,
+  InternalResolveOptions,
+  Plugin,
+  ResolvedConfig,
+  ViteDevServer,
+} from 'vite'
+import * as vite from 'vite'
 
 const DEBUG = env.DEBUG
 const SPECIAL_QUERY_RE = /[?&](?:worker|sharedworker|raw|url)\b/
 const COMMON_JS_PROXY_RE = /\?commonjs-proxy/
-const INLINE_STYLE_ID_RE = /[?&]index\=\d+\.css$/
+const INLINE_STYLE_ID_RE = /[?&]index=\d+\.css$/
 
-export default function tailwindcss(): Plugin[] {
+export type PluginOptions = {
+  /**
+   * Optimize and minify the output CSS.
+   */
+  optimize?: boolean | { minify?: boolean }
+}
+
+function createCustomResolver(
+  resolvers: ((id: string, importer: string) => Promise<string | undefined>)[],
+  filter = (_path: string) => true,
+) {
+  return async (id: string, base: string) => {
+    // The resolver expects an `importer` file. We don't really know where the
+    // current `id` was imported from, but Vite will essentially do a
+    // `path.dirname(importer)` so it doesn't really matter.
+    //
+    // It does matter that this is a file, otherwise we would go up a directory,
+    // which means that we would be resolving files from a parent folder first,
+    // instead of the current folder we are in.
+    let importer = path.resolve(base, '__placeholder__.css')
+
+    for (let resolver of resolvers) {
+      let resolved = await resolver(id, importer)
+
+      // If we didn't resolve, we don't have to bail immediately, but we can try
+      // the next resolver
+      if (!resolved) continue
+
+      if (resolved === id) continue
+
+      // Looks like a relative file, let's resolve it to an absolute path
+      if (resolved[0] === '.') resolved = path.resolve(base, resolved)
+
+      // Must adhere to additional filters (e.g.: must be a .css file)
+      if (!filter(resolved)) continue
+
+      // If it's not an absolute path, then we don't really know how to read
+      // the file from disk.
+      if (!path.isAbsolute(resolved)) continue
+
+      return resolved
+    }
+  }
+}
+
+export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
   let servers: ViteDevServer[] = []
   let config: ResolvedConfig | null = null
+  let rootsByEnv = new DefaultMap<string, Map<string, Root>>((env: string) => new Map())
 
   let isSSR = false
-  let minify = false
+  let shouldOptimize = true
+  let minify = true
 
-  let roots: DefaultMap<string, Root> = new DefaultMap((id) => {
-    let cssResolver = config!.createResolver({
-      ...config!.resolve,
-      extensions: ['.css'],
-      mainFields: ['style'],
-      conditions: ['style', 'development|production'],
-      tryIndex: false,
-      preferRelative: true,
-    })
-    function customCssResolver(id: string, base: string) {
-      return cssResolver(id, base, true, isSSR)
+  function createRoot(env: Environment | null, id: string) {
+    type ResolveFn = (id: string, base: string) => Promise<string | false | undefined>
+
+    let customCssResolver: ResolveFn
+    let customJsResolver: ResolveFn
+
+    if (!env) {
+      // Older, pre-environment Vite API
+      // TODO: Can we drop this??
+      let cssResolver = config!.createResolver({
+        ...config!.resolve,
+        extensions: ['.css'],
+        mainFields: ['style'],
+        conditions: ['style', 'development|production'],
+        tryIndex: false,
+        preferRelative: true,
+      })
+
+      let jsResolver = config!.createResolver(config!.resolve)
+
+      customCssResolver = createCustomResolver(
+        [
+          (id, importer) => cssResolver(id, importer, true, isSSR),
+          (id, importer) => cssResolver(id, importer, false, isSSR),
+        ],
+        (path) => path.endsWith('.css'),
+      )
+      customJsResolver = createCustomResolver(
+        [
+          (id, importer) => jsResolver(id, importer, true, isSSR),
+          (id, importer) => jsResolver(id, importer, false, isSSR),
+        ],
+        (path) => !path.endsWith('.css'),
+      )
+    } else {
+      type ResolveIdFn = (
+        environment: Environment,
+        id: string,
+        importer?: string,
+        aliasOnly?: boolean,
+      ) => Promise<string | undefined>
+
+      // There are cases where Environment API is available,
+      // but `createResolver` is still overridden (for example astro v5)
+      //
+      // Copied as-is from vite, because this function is not a part of public API
+      //
+      // TODO: Remove this function and pre-environment code when Vite < 7 is no longer supported
+      function createBackCompatIdResolver(
+        config: ResolvedConfig,
+        options?: Partial<InternalResolveOptions>,
+      ): ResolveIdFn {
+        const compatResolve = config.createResolver(options)
+        let resolve: ResolveIdFn
+        return async (environment, id, importer, aliasOnly) => {
+          if (environment.name === 'client' || environment.name === 'ssr') {
+            return compatResolve(id, importer, aliasOnly, environment.name === 'ssr')
+          }
+          resolve ??= vite.createIdResolver(config, options)
+          return resolve(environment, id, importer, aliasOnly)
+        }
+      }
+
+      // Newer Vite versions
+      let cssResolver = createBackCompatIdResolver(env.config, {
+        ...env.config.resolve,
+        extensions: ['.css'],
+        mainFields: ['style'],
+        conditions: ['style', 'development|production'],
+        tryIndex: false,
+        preferRelative: true,
+      })
+
+      let jsResolver = createBackCompatIdResolver(env.config, env.config.resolve)
+
+      customCssResolver = createCustomResolver(
+        [
+          (id, importer) => cssResolver(env, id, importer, true),
+          (id, importer) => cssResolver(env, id, importer, false),
+        ],
+        (path) => path.endsWith('.css'),
+      )
+      customJsResolver = createCustomResolver(
+        [
+          (id, importer) => jsResolver(env, id, importer, true),
+          (id, importer) => jsResolver(env, id, importer, false),
+        ],
+        (path) => !path.endsWith('.css'),
+      )
     }
 
-    let jsResolver = config!.createResolver(config!.resolve)
-    function customJsResolver(id: string, base: string) {
-      return jsResolver(id, base, true, isSSR)
-    }
     return new Root(
       id,
       config!.root,
@@ -51,7 +180,7 @@ export default function tailwindcss(): Plugin[] {
       customCssResolver,
       customJsResolver,
     )
-  })
+  }
 
   return [
     {
@@ -65,8 +194,22 @@ export default function tailwindcss(): Plugin[] {
 
       async configResolved(_config) {
         config = _config
-        minify = config.build.cssMinify !== false
         isSSR = config.build.ssr !== false && config.build.ssr !== undefined
+
+        // By default we optimize CSS during the build phase but if the user
+        // provides explicit options we'll use those instead
+        if (opts.optimize !== undefined) {
+          shouldOptimize = opts.optimize !== false
+        }
+
+        // Minification is also performed when optimizing as long as it's also
+        // enabled in Vite
+        minify = shouldOptimize && config.build.cssMinify !== false
+
+        // But again, the user can override that choice explicitly
+        if (typeof opts.optimize === 'object') {
+          minify = opts.optimize.minify !== false
+        }
       },
     },
 
@@ -75,23 +218,114 @@ export default function tailwindcss(): Plugin[] {
       name: '@tailwindcss/vite:generate:serve',
       apply: 'serve',
       enforce: 'pre',
+      transform: {
+        filter: {
+          id: {
+            exclude: [/\/\.vite\//, SPECIAL_QUERY_RE, COMMON_JS_PROXY_RE],
+            include: [/\.css(?:\?.*)?$/, /&lang\.css/, INLINE_STYLE_ID_RE],
+          },
+        },
+        async handler(src, id) {
+          if (!isPotentialCssRootFile(id)) return
 
-      async transform(src, id, options) {
-        if (!isPotentialCssRootFile(id)) return
+          using I = new Instrumentation()
+          DEBUG && I.start('[@tailwindcss/vite] Generate CSS (serve)')
 
-        using I = new Instrumentation()
-        DEBUG && I.start('[@tailwindcss/vite] Generate CSS (serve)')
+          let roots = rootsByEnv.get(this.environment?.name ?? 'default')
+          let root = roots.get(id)
+          if (!root) {
+            root ??= createRoot(this.environment ?? null, id)
+            roots.set(id, root)
+          }
 
-        let root = roots.get(id)
+          let result = await root.generate(src, (file) => this.addWatchFile(file), I)
+          if (!result) {
+            roots.delete(id)
+            return
+          }
 
-        let result = await root.generate(src, (file) => this.addWatchFile(file), I)
-        if (!result) {
-          roots.delete(id)
-          return src
+          DEBUG && I.end('[@tailwindcss/vite] Generate CSS (serve)')
+          return result
+        },
+      },
+
+      hotUpdate({ file, modules, timestamp, server }) {
+        // Ensure full-reloads are triggered for files that are being watched by
+        // Tailwind but aren't part of the module graph (like PHP or HTML
+        // files). If we don't do this, then changes to those files won't
+        // trigger a reload at all since Vite doesn't know about them.
+        {
+          // It's a little bit confusing, because due to the `addWatchFile`
+          // calls, it _is_ part of the module graph but nothing is really
+          // handling those files. These modules typically have an id of
+          // undefined and/or have a type of 'asset'.
+          //
+          // If we call `addWatchFile` on a file that is part of the actual
+          // module graph, then we will see a module for it with a type of `js`
+          // and a type of `asset`. We are only interested if _all_ of them are
+          // missing an id and/or have a type of 'asset', which is a strong
+          // signal that the changed file is not being handled by Vite or any of
+          // the plugins.
+          //
+          // Note: in Vite v7.0.6 the modules here will have a type of `js`, not
+          // 'asset'. But it will also have a `HARD_INVALIDATED` state and will
+          // do a full page reload already.
+          //
+          // Empty modules can be skipped since it means it's not `addWatchFile`d and thus irrelevant to Tailwind.
+          let isExternalFile =
+            modules.length > 0 &&
+            modules.every((mod) => mod.type === 'asset' || mod.id === undefined)
+          if (!isExternalFile) return
+
+          // Skip if the module exists in other environments. SSR framework has
+          // its own server side hmr/reload mechanism when handling server
+          // only modules. See https://v6.vite.dev/guide/migration.html
+          // > Updates to an SSR-only module no longer triggers a full page reload in the client. ...
+          for (let environment of Object.values(server.environments)) {
+            if (environment.name === this.environment.name) continue
+
+            let modules = environment.moduleGraph.getModulesByFile(file)
+            if (modules) {
+              for (let module of modules) {
+                if (module.type !== 'asset') {
+                  return
+                }
+              }
+            }
+          }
+
+          for (let env of new Set([this.environment.name, 'client'])) {
+            let roots = rootsByEnv.get(env)
+            if (roots.size === 0) continue
+
+            // If the file is not being watched by any of the roots, then we can
+            // skip the reload since it's not relevant to Tailwind CSS.
+            if (!isScannedFile(file, modules, roots)) {
+              continue
+            }
+
+            // https://vite.dev/changes/hotupdate-hook#migration-guide
+            let invalidatedModules = new Set<vite.EnvironmentModuleNode>()
+            for (let mod of modules) {
+              this.environment.moduleGraph.invalidateModule(
+                mod,
+                invalidatedModules,
+                timestamp,
+                true,
+              )
+            }
+
+            if (env === this.environment.name) {
+              this.environment.hot.send({ type: 'full-reload' })
+            } else if (server.hot.send) {
+              server.hot.send({ type: 'full-reload' })
+            } else if (server.ws.send) {
+              server.ws.send({ type: 'full-reload' })
+            }
+
+            return []
+          }
         }
-
-        DEBUG && I.end('[@tailwindcss/vite] Generate CSS (serve)')
-        return result
       },
     },
 
@@ -100,30 +334,44 @@ export default function tailwindcss(): Plugin[] {
       name: '@tailwindcss/vite:generate:build',
       apply: 'build',
       enforce: 'pre',
+      transform: {
+        filter: {
+          id: {
+            exclude: [/\/\.vite\//, SPECIAL_QUERY_RE, COMMON_JS_PROXY_RE],
+            include: [/\.css(?:\?.*)?$/, /&lang\.css/, INLINE_STYLE_ID_RE],
+          },
+        },
+        async handler(src, id) {
+          if (!isPotentialCssRootFile(id)) return
 
-      async transform(src, id) {
-        if (!isPotentialCssRootFile(id)) return
+          using I = new Instrumentation()
+          DEBUG && I.start('[@tailwindcss/vite] Generate CSS (build)')
 
-        using I = new Instrumentation()
-        DEBUG && I.start('[@tailwindcss/vite] Generate CSS (build)')
+          let roots = rootsByEnv.get(this.environment?.name ?? 'default')
+          let root = roots.get(id)
+          if (!root) {
+            root ??= createRoot(this.environment ?? null, id)
+            roots.set(id, root)
+          }
 
-        let root = roots.get(id)
+          let result = await root.generate(src, (file) => this.addWatchFile(file), I)
+          if (!result) {
+            roots.delete(id)
+            return
+          }
+          DEBUG && I.end('[@tailwindcss/vite] Generate CSS (build)')
 
-        let result = await root.generate(src, (file) => this.addWatchFile(file), I)
-        if (!result) {
-          roots.delete(id)
-          return src
-        }
-        DEBUG && I.end('[@tailwindcss/vite] Generate CSS (build)')
+          if (shouldOptimize) {
+            DEBUG && I.start('[@tailwindcss/vite] Optimize CSS')
+            result = optimize(result.code, {
+              minify,
+              map: result.map,
+            })
+            DEBUG && I.end('[@tailwindcss/vite] Optimize CSS')
+          }
 
-        DEBUG && I.start('[@tailwindcss/vite] Optimize CSS')
-        result = optimize(result.code, {
-          minify,
-          map: result.map,
-        })
-        DEBUG && I.end('[@tailwindcss/vite] Optimize CSS')
-
-        return result
+          return result
+        },
       },
     },
   ] satisfies Plugin[]
@@ -135,13 +383,15 @@ function getExtension(id: string) {
 }
 
 function isPotentialCssRootFile(id: string) {
-  if (id.includes('/.vite/')) return
+  if (id.includes('/.vite/')) return false
+
+  // Don't intercept special static asset resources
+  if (SPECIAL_QUERY_RE.test(id)) return false
+  if (COMMON_JS_PROXY_RE.test(id)) return false
+
   let extension = getExtension(id)
-  let isCssFile =
-    (extension === 'css' || id.includes('&lang.css') || id.match(INLINE_STYLE_ID_RE)) &&
-    // Don't intercept special static asset resources
-    !SPECIAL_QUERY_RE.test(id) &&
-    !COMMON_JS_PROXY_RE.test(id)
+  let isCssFile = extension === 'css' || id.includes('&lang.css') || id.match(INLINE_STYLE_ID_RE)
+
   return isCssFile
 }
 
@@ -197,6 +447,10 @@ class Root {
     private customJsResolver: (id: string, base: string) => Promise<string | false | undefined>,
   ) {}
 
+  get scannedFiles() {
+    return this.scanner?.files ?? []
+  }
+
   // Generate the CSS for the root file. This can return false if the file is
   // not considered a Tailwind root. When this happened, the root can be GCed.
   public async generate(
@@ -213,7 +467,7 @@ class Root {
     let inputPath = idToPath(this.id)
 
     function addWatchFile(file: string) {
-      // Don't watch the input file since it's already a dependency anc causes
+      // Don't watch the input file since it's already a dependency and causes
       // issues with some setups (e.g. Qwik).
       if (file === inputPath) {
         return
@@ -223,7 +477,7 @@ class Root {
       // crash Vite. We work around this for now by ignoring updates to them.
       //
       // https://github.com/tailwindlabs/tailwindcss/issues/16877
-      if (/[\#\?].*\.svg$/.test(file)) {
+      if (/[#?].*\.svg$/.test(file)) {
         return
       }
       _addWatchFile(file)
@@ -283,7 +537,11 @@ class Root {
     if (
       !(
         this.compiler.features &
-        (Features.AtApply | Features.JsPluginCompat | Features.ThemeFunction | Features.Utilities)
+        (Features.AtApply |
+          Features.JsPluginCompat |
+          Features.ThemeFunction |
+          Features.Utilities |
+          Features.Variants)
       )
     ) {
       return false
@@ -301,6 +559,7 @@ class Root {
     }
 
     if (this.compiler.features & Features.Utilities) {
+      DEBUG && I.start('Register dependency messages')
       // Watch individual files found via custom `@source` paths
       for (let file of this.scanner.files) {
         addWatchFile(file)
@@ -337,6 +596,7 @@ class Root {
           }
         }
       }
+      DEBUG && I.end('Register dependency messages')
     }
 
     DEBUG && I.start('Build CSS')
@@ -375,4 +635,55 @@ class Root {
     }
     return false
   }
+}
+
+function isScannedFile(
+  file: string,
+  modules: vite.EnvironmentModuleNode[],
+  roots: Map<string, Root>,
+) {
+  let seen = new Set()
+  let q = [...modules]
+  let checks = {
+    file,
+    get realpath() {
+      try {
+        let realpath = realpathSync(file)
+        Object.defineProperty(checks, 'realpath', { value: realpath })
+        return realpath
+      } catch {
+        return null
+      }
+    },
+  }
+
+  while (q.length > 0) {
+    let module = q.shift()!
+    if (seen.has(module)) continue
+    seen.add(module)
+
+    if (module.id) {
+      let root = roots.get(module.id)
+
+      if (root) {
+        // If the file is part of the scanned files for this root, then we know
+        // for sure that it's being watched by any of the Tailwind CSS roots. It
+        // doesn't matter which root it is since it's only used to know whether
+        // we should trigger a full reload or not.
+        if (
+          root.scannedFiles.includes(checks.file) ||
+          (checks.realpath && root.scannedFiles.includes(checks.realpath))
+        ) {
+          return true
+        }
+      }
+    }
+
+    // Keep walking up the tree until we find a root.
+    for (let importer of module.importers) {
+      q.push(importer)
+    }
+  }
+
+  return false
 }

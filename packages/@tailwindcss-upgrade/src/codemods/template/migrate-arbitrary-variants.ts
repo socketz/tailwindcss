@@ -1,17 +1,23 @@
+import { cloneCandidate } from '../../../../tailwindcss/src/candidate'
+import {
+  PRE_COMPUTED_VARIANTS_KEY,
+  prepareDesignSystemStorage,
+  VARIANT_SIGNATURE_KEY,
+} from '../../../../tailwindcss/src/canonicalize-candidates'
 import type { Config } from '../../../../tailwindcss/src/compat/plugin-api'
 import type { DesignSystem } from '../../../../tailwindcss/src/design-system'
-import { replaceObject } from '../../utils/replace-object'
-import type { Writable } from '../../utils/types'
+import type { Writable } from '../../../../tailwindcss/src/types'
+import { replaceObject } from '../../../../tailwindcss/src/utils/replace-object'
 import { walkVariants } from '../../utils/walk-variants'
-import { computeVariantSignature, preComputedVariants } from './signatures'
 
 export function migrateArbitraryVariants(
-  designSystem: DesignSystem,
+  baseDesignSystem: DesignSystem,
   _userConfig: Config | null,
   rawCandidate: string,
 ): string {
-  let signatures = computeVariantSignature.get(designSystem)
-  let variants = preComputedVariants.get(designSystem)
+  let designSystem = prepareDesignSystemStorage(baseDesignSystem)
+  let signatures = designSystem.storage[VARIANT_SIGNATURE_KEY]
+  let variants = designSystem.storage[PRE_COMPUTED_VARIANTS_KEY]
 
   for (let readonlyCandidate of designSystem.parseCandidate(rawCandidate)) {
     // We are only interested in the variants
@@ -19,7 +25,7 @@ export function migrateArbitraryVariants(
 
     // The below logic makes use of mutation. Since candidates in the
     // DesignSystem are cached, we can't mutate them directly.
-    let candidate = structuredClone(readonlyCandidate) as Writable<typeof readonlyCandidate>
+    let candidate = cloneCandidate(readonlyCandidate) as Writable<typeof readonlyCandidate>
 
     for (let [variant] of walkVariants(candidate)) {
       if (variant.kind === 'compound') continue

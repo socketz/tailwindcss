@@ -1,10 +1,11 @@
 import dedent from 'dedent'
 import fastGlob from 'fast-glob'
-import { exec, spawn } from 'node:child_process'
+import { exec, execFile, spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { platform, tmpdir } from 'node:os'
 import path from 'node:path'
-import { stripVTControlCharacters } from 'node:util'
+import { promisify, stripVTControlCharacters } from 'node:util'
 import { RawSourceMap, SourceMapConsumer } from 'source-map-js'
 import { test as defaultTest, type ExpectStatic } from 'vitest'
 import { createLineTable } from '../packages/tailwindcss/src/source-maps/line-table'
@@ -16,7 +17,7 @@ const PUBLIC_PACKAGES = (await fs.readdir(path.join(REPO_ROOT, 'dist'))).map((na
 )
 
 interface SpawnedProcess {
-  dispose: () => void
+  dispose: () => Promise<void>
   flush: () => void
   onStdout: (predicate: (message: string) => boolean) => Promise<void>
   onStderr: (predicate: (message: string) => boolean) => Promise<void>
@@ -37,6 +38,7 @@ interface TestConfig {
     [filePath: string]: string | Uint8Array
   }
 
+  timeout?: number
   installDependencies?: boolean
 }
 interface TestContext {
@@ -47,15 +49,17 @@ interface TestContext {
   parseSourceMap(opts: string | SourceMapOptions): SourceMap
   fs: {
     write(filePath: string, content: string, encoding?: BufferEncoding): Promise<void>
+    symlink(dst: string, src: string): Promise<void>
     create(filePaths: string[]): Promise<void>
     read(filePath: string): Promise<string>
+    delete(filePath: string): Promise<void>
     glob(pattern: string): Promise<[string, string][]>
     dumpFiles(pattern: string): Promise<string>
     expectFileToContain(
       filePath: string,
       contents: string | RegExp | (string | RegExp)[],
     ): Promise<void>
-    expectFileNotToContain(filePath: string, contents: string | string[]): Promise<void>
+    expectFileNotToContain(filePath: string, contents: string[]): Promise<void>
   }
 }
 type TestCallback = (context: TestContext) => Promise<void> | void
@@ -63,11 +67,14 @@ interface TestFlags {
   only?: boolean
   skip?: boolean
   debug?: boolean
+  concurrent?: boolean
 }
 
 type SpawnActor = { predicate: (message: string) => boolean; resolve: () => void }
 
 export const IS_WINDOWS = platform() === 'win32'
+
+const execFileAsync = promisify(execFile)
 
 const TEST_TIMEOUT = IS_WINDOWS ? 120000 : 60000
 const ASSERTION_TIMEOUT = IS_WINDOWS ? 10000 : 5000
@@ -81,16 +88,16 @@ export function test(
   name: string,
   config: TestConfig,
   testCallback: TestCallback,
-  { only = false, skip = false, debug = false }: TestFlags = {},
+  { only = false, skip = false, debug = false, concurrent = false }: TestFlags = {},
 ) {
   return defaultTest(
     name,
     {
-      timeout: TEST_TIMEOUT,
+      timeout: config.timeout ?? TEST_TIMEOUT,
       retry: process.env.CI ? 2 : 0,
       only: only || (!process.env.CI && debug),
       skip,
-      concurrent: true,
+      concurrent,
     },
     async (options) => {
       let rootDir = debug ? path.join(REPO_ROOT, '.debug') : TMP_ROOT
@@ -169,6 +176,7 @@ export function test(
           if (debug) console.log(`>& ${command}`)
           let child = spawn(command, {
             cwd,
+            detached: !IS_WINDOWS,
             shell: true,
             ...childProcessOptions,
             env: {
@@ -177,22 +185,26 @@ export function test(
             },
           })
 
-          function dispose() {
-            if (!child.kill()) {
-              child.kill('SIGKILL')
-            }
+          let disposed = false
 
-            let timer = setTimeout(
-              () =>
-                rejectDisposal?.(new Error(`spawned process (${command}) did not exit in time`)),
-              ASSERTION_TIMEOUT,
+          async function dispose() {
+            if (disposed) return disposePromise
+            disposed = true
+
+            await killProcessTree(child)
+
+            let timer = setTimeout(() => {
+              forceKillProcessTree(child)
+              rejectDisposal?.(new Error(`spawned process (${command}) did not exit in time`))
+            }, ASSERTION_TIMEOUT)
+            disposePromise.then(
+              () => clearTimeout(timer),
+              () => clearTimeout(timer),
             )
-            disposePromise.finally(() => {
-              clearTimeout(timer)
-            })
             return disposePromise
           }
           disposables.push(dispose)
+
           function onExit() {
             resolveDisposal?.()
           }
@@ -283,11 +295,7 @@ export function test(
           }
         },
         fs: {
-          async write(
-            filename: string,
-            content: string | Uint8Array,
-            encoding: BufferEncoding = 'utf8',
-          ): Promise<void> {
+          async write(filename, content, encoding = 'utf8') {
             let full = path.join(root, filename)
             let dir = path.dirname(full)
             await fs.mkdir(dir, { recursive: true })
@@ -308,7 +316,19 @@ export function test(
             await fs.writeFile(full, content, encoding)
           },
 
-          async create(filenames: string[]): Promise<void> {
+          async symlink(target, src) {
+            let targetAbsolute = path.join(root, target)
+            let targetParent = path.dirname(targetAbsolute)
+            await fs.mkdir(targetParent, { recursive: true })
+
+            let srcAbsolute = path.join(root, src)
+            let srcParent = path.dirname(srcAbsolute)
+            await fs.mkdir(srcParent, { recursive: true })
+
+            await fs.symlink(targetAbsolute, srcAbsolute)
+          },
+
+          async create(filenames) {
             for (let filename of filenames) {
               let full = path.join(root, filename)
 
@@ -318,7 +338,11 @@ export function test(
             }
           },
 
-          async read(filePath: string) {
+          async delete(filename) {
+            await fs.unlink(path.join(root, filename))
+          },
+
+          async read(filePath) {
             let content = await fs.readFile(path.resolve(root, filePath), 'utf8')
 
             // Ensure that files read on Windows have \r\n line endings removed
@@ -328,7 +352,7 @@ export function test(
 
             return content
           },
-          async glob(pattern: string) {
+          async glob(pattern) {
             let files = await fastGlob(pattern, { cwd: root })
             return Promise.all(
               files.map(async (file) => {
@@ -341,7 +365,7 @@ export function test(
               }),
             )
           },
-          async dumpFiles(pattern: string) {
+          async dumpFiles(pattern) {
             let files = await context.fs.glob(pattern)
             return `\n${files
               .slice()
@@ -401,7 +425,17 @@ export function test(
       `
 
       for (let [filename, content] of Object.entries(config.fs)) {
-        await context.fs.write(filename, content)
+        if (content.toString().startsWith('symlink:')) {
+          // The symlink path is relative to the target destination's path
+          let target = path.join(
+            filename,
+            content.toString().slice('symlink:'.length), // Relative path
+          )
+
+          await context.fs.symlink(target, filename)
+        } else {
+          await context.fs.write(filename, content)
+        }
       }
 
       let shouldInstallDependencies = config.installDependencies ?? true
@@ -426,10 +460,17 @@ export function test(
       let disposables: (() => Promise<void>)[] = []
 
       async function dispose() {
-        await Promise.all(disposables.map((dispose) => dispose()))
+        let results = await Promise.allSettled(disposables.map((dispose) => dispose()))
 
         if (!debug) {
           await gracefullyRemove(root)
+        }
+
+        let errors = results.flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        )
+        if (errors.length > 0) {
+          throw new AggregateError(errors, 'Failed to clean up spawned processes')
         }
       }
 
@@ -440,7 +481,7 @@ export function test(
         try {
           await context.exec('git init', { cwd: root })
           await context.exec('git add --all', { cwd: root })
-          await context.exec('git commit -m "before migration"', { cwd: root })
+          await context.exec('git commit -m "before migration" --allow-empty', { cwd: root })
         } catch (error: any) {
           console.error(error)
           console.error(error.stdout?.toString())
@@ -458,6 +499,9 @@ test.only = (name: string, config: TestConfig, testCallback: TestCallback) => {
 }
 test.skip = (name: string, config: TestConfig, testCallback: TestCallback) => {
   return test(name, config, testCallback, { skip: true })
+}
+test.concurrent = (name: string, config: TestConfig, testCallback: TestCallback) => {
+  return test(name, config, testCallback, { concurrent: true })
 }
 test.debug = (name: string, config: TestConfig, testCallback: TestCallback) => {
   return test(name, config, testCallback, { debug: true })
@@ -497,6 +541,7 @@ async function overwriteVersionsInPackageJson(content: string): Promise<string> 
       json.pnpm.overrides['@tailwindcss/cli>tailwindcss'] = resolveVersion(pkg)
       json.pnpm.overrides['@tailwindcss/postcss>tailwindcss'] = resolveVersion(pkg)
       json.pnpm.overrides['@tailwindcss/vite>tailwindcss'] = resolveVersion(pkg)
+      json.pnpm.overrides['@tailwindcss/webpack>tailwindcss'] = resolveVersion(pkg)
     } else {
       json.pnpm.overrides[pkg] = resolveVersion(pkg)
     }
@@ -552,6 +597,7 @@ export async function retryAssertion<T>(
     try {
       return await fn()
     } catch (err) {
+      Error.captureStackTrace(err, retryAssertion)
       error = err
       await new Promise((resolve) => setTimeout(resolve, delay))
     }
@@ -567,7 +613,7 @@ export async function fetchStyles(base: string, path = '/'): Promise<string> {
   let index = await fetch(`${base}${path}`)
   let html = await index.text()
 
-  let linkRegex = /<link rel="stylesheet" href="([a-zA-Z0-9\/_\.\?=%-]+)"/gi
+  let linkRegex = /<link rel="stylesheet" href="([a-zA-Z0-9/_.?=%-]+)"/gi
   let styleRegex = /<style\b[^>]*>([\s\S]*?)<\/style>/gi
 
   let stylesheets: string[] = []
@@ -602,6 +648,65 @@ export async function fetchStyles(base: string, path = '/'): Promise<string> {
     acc += css
     return acc
   }, '')
+}
+
+export async function getRandomPort() {
+  return new Promise<number>((resolve, reject) => {
+    let server = createServer()
+    server.unref()
+    server.on('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      let address = server.address()
+      server.close(() => {
+        if (address && typeof address === 'object') {
+          resolve(address.port)
+        } else {
+          reject(new Error('Unable to allocate random port'))
+        }
+      })
+    })
+  })
+}
+
+async function killProcessTree(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+    return
+  }
+
+  if (IS_WINDOWS) {
+    await execFileAsync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+      timeout: ASSERTION_TIMEOUT,
+      windowsHide: true,
+    }).catch(() => {})
+    return
+  }
+
+  try {
+    process.kill(-child.pid, 'SIGTERM')
+  } catch (error: any) {
+    if (error?.code !== 'ESRCH') {
+      child.kill()
+    }
+  }
+}
+
+function forceKillProcessTree(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+    return
+  }
+
+  if (IS_WINDOWS) {
+    execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {})
+    return
+  }
+
+  try {
+    process.kill(-child.pid, 'SIGKILL')
+  } catch (error: any) {
+    if (error?.code !== 'ESRCH') {
+      child.kill('SIGKILL')
+    }
+  }
 }
 
 async function gracefullyRemove(dir: string) {

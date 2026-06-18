@@ -1,10 +1,10 @@
 import {
   atRoot,
   atRule,
+  cloneAstNode,
   decl,
   rule,
   styleRule,
-  walk,
   type AstNode,
   type AtRule,
   type Declaration,
@@ -15,19 +15,21 @@ import type { DesignSystem } from './design-system'
 import type { Theme, ThemeKey } from './theme'
 import { compareBreakpoints } from './utils/compare-breakpoints'
 import { DefaultMap } from './utils/default-map'
+import { dimensions } from './utils/dimensions'
+import { unescape } from './utils/escape'
 import {
   inferDataType,
+  isLength,
   isPositiveInteger,
   isStrictPositiveInteger,
   isValidOpacityValue,
   isValidSpacingMultiplier,
 } from './utils/infer-data-type'
+import { addWhitespaceAroundMathOperators } from './utils/math-operators'
 import { replaceShadowColors } from './utils/replace-shadow-colors'
 import { segment } from './utils/segment'
 import * as ValueParser from './value-parser'
-
-const IS_VALID_STATIC_UTILITY_NAME = /^-?[a-z][a-zA-Z0-9/%._-]*$/
-const IS_VALID_FUNCTIONAL_UTILITY_NAME = /^-?[a-z][a-zA-Z0-9/%._-]*-\*$/
+import { walk, WalkAction } from './walk'
 
 const DEFAULT_SPACING_SUGGESTIONS = [
   '0',
@@ -120,13 +122,22 @@ export class Utilities {
   }
 
   getCompletions(name: string): SuggestionGroup[] {
+    if (this.has(name, 'static')) {
+      return (
+        this.completions.get(name)?.() ?? [{ supportsNegative: false, values: [], modifiers: [] }]
+      )
+    }
+
     return this.completions.get(name)?.() ?? []
   }
 
   suggest(name: string, groups: () => SuggestionGroup[]) {
-    // TODO: We are calling this multiple times on purpose but ideally only ever
-    // once per utility root.
-    this.completions.set(name, groups)
+    let existingGroups = this.completions.get(name)
+    if (existingGroups) {
+      this.completions.set(name, () => [...existingGroups?.(), ...groups?.()])
+    } else {
+      this.completions.set(name, groups)
+    }
   }
 
   keys(kind: 'static' | 'functional') {
@@ -182,7 +193,7 @@ export function withAlpha(value: string, alpha: string): string {
 }
 
 /**
- * Apply opacity to a color using `color-mix`.
+ * Replace the opacity in a color using relative color syntax.
  */
 export function replaceAlpha(value: string, alpha: string): string {
   // Convert numeric values (like `0.5`) to percentages (like `50%`) so they
@@ -371,6 +382,7 @@ export function createUtilities(theme: Theme) {
     supportsFractions?: boolean
     themeKeys?: ThemeKey[]
     defaultValue?: string | null
+    staticValues?: Record<string, AstNode[]>
     handleBareValue?: (value: NamedUtilityValue) => string | null
     handleNegativeBareValue?: (value: NamedUtilityValue) => string | null
     handle: (value: string, dataType: string | null) => AstNode[] | undefined
@@ -381,6 +393,8 @@ export function createUtilities(theme: Theme) {
    * user's theme.
    */
   function functionalUtility(classRoot: string, desc: UtilityDescription) {
+    if (desc.staticValues) desc.staticValues = Object.assign(Object.create(null), desc.staticValues)
+
     function handleFunctionalUtility({ negative }: { negative: boolean }) {
       return (candidate: Extract<Candidate, { kind: 'functional' }>) => {
         let value: string | null = null
@@ -412,7 +426,7 @@ export function createUtilities(theme: Theme) {
           if (value === null && desc.supportsFractions && candidate.value.fraction) {
             let [lhs, rhs] = segment(candidate.value.fraction, '/')
             if (!isPositiveInteger(lhs) || !isPositiveInteger(rhs)) return
-            value = `calc(${candidate.value.fraction} * 100%)`
+            value = `calc(${lhs} / ${rhs} * 100%)`
           }
 
           // If there is still no value but the utility supports bare values,
@@ -427,13 +441,21 @@ export function createUtilities(theme: Theme) {
             value = desc.handleBareValue(candidate.value)
             if (!value?.includes('/') && candidate.modifier) return
           }
+
+          if (value === null && !negative && desc.staticValues && !candidate.modifier) {
+            let fallback = desc.staticValues[candidate.value.value]
+            if (fallback) return fallback.map(cloneAstNode)
+          }
         }
 
         // If there is no value, don't generate any rules.
         if (value === null) return
 
         // Negate the value if the candidate has a negative prefix.
-        return desc.handle(negative ? `calc(${value} * -1)` : value, dataType)
+        return desc.handle(
+          negative ? addWhitespaceAroundMathOperators(`calc(${value} * -1)`) : value,
+          dataType,
+        )
       }
     }
 
@@ -450,6 +472,13 @@ export function createUtilities(theme: Theme) {
         supportsFractions: desc.supportsFractions,
       },
     ])
+
+    // Also suggest any staticValues automatically so callers don't need to
+    // manually add suggestion groups for e.g. `auto`, `none`, `full`, etc.
+    if (desc.staticValues && Object.keys(desc.staticValues).length > 0) {
+      let values = Object.keys(desc.staticValues)
+      suggest(classRoot, () => [{ values }])
+    }
   }
 
   type ColorUtilityDescription = {
@@ -502,9 +531,11 @@ export function createUtilities(theme: Theme) {
     {
       supportsNegative = false,
       supportsFractions = false,
+      staticValues,
     }: {
       supportsNegative?: boolean
       supportsFractions?: boolean
+      staticValues?: Record<string, AstNode[]>
     } = {},
   ) {
     if (supportsNegative) {
@@ -521,16 +552,17 @@ export function createUtilities(theme: Theme) {
         if (!multiplier) return null
         if (!isValidSpacingMultiplier(value)) return null
 
-        return `calc(${multiplier} * ${value})`
+        return `--spacing(${value})`
       },
       handleNegativeBareValue: ({ value }) => {
         let multiplier = theme.resolve(null, ['--spacing'])
         if (!multiplier) return null
         if (!isValidSpacingMultiplier(value)) return null
 
-        return `calc(${multiplier} * -${value})`
+        return `--spacing(-${value})`
       },
       handle,
+      staticValues,
     })
 
     suggest(name, () => [
@@ -556,7 +588,7 @@ export function createUtilities(theme: Theme) {
     ['padding', '0'],
     ['margin', '-1px'],
     ['overflow', 'hidden'],
-    ['clip', 'rect(0, 0, 0, 0)'],
+    ['clip-path', 'inset(50%)'],
     ['white-space', 'nowrap'],
     ['border-width', '0'],
   ])
@@ -567,7 +599,7 @@ export function createUtilities(theme: Theme) {
     ['padding', '0'],
     ['margin', '0'],
     ['overflow', 'visible'],
-    ['clip', 'auto'],
+    ['clip-path', 'none'],
     ['white-space', 'normal'],
   ])
 
@@ -600,8 +632,10 @@ export function createUtilities(theme: Theme) {
     ['inset', 'inset'],
     ['inset-x', 'inset-inline'],
     ['inset-y', 'inset-block'],
-    ['start', 'inset-inline-start'],
-    ['end', 'inset-inline-end'],
+    ['inset-s', 'inset-inline-start'],
+    ['inset-e', 'inset-inline-end'],
+    ['inset-bs', 'inset-block-start'],
+    ['inset-be', 'inset-block-end'],
     ['top', 'top'],
     ['right', 'right'],
     ['bottom', 'bottom'],
@@ -625,7 +659,6 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `z-index`
    */
-  staticUtility('z-auto', [['z-index', 'auto']])
   functionalUtility('z', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -634,6 +667,9 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--z-index'],
     handle: (value) => [decl('z-index', value)],
+    staticValues: {
+      auto: [decl('z-index', 'auto')],
+    },
   })
 
   suggest('z', () => [
@@ -647,8 +683,6 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `order`
    */
-  staticUtility('order-first', [['order', '-9999']])
-  staticUtility('order-last', [['order', '9999']])
   functionalUtility('order', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -657,6 +691,10 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--order'],
     handle: (value) => [decl('order', value)],
+    staticValues: {
+      first: [decl('order', '-9999')],
+      last: [decl('order', '9999')],
+    },
   })
 
   suggest('order', () => [
@@ -670,7 +708,6 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `grid-column`
    */
-  staticUtility('col-auto', [['grid-column', 'auto']])
   functionalUtility('col', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -679,20 +716,25 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-column'],
     handle: (value) => [decl('grid-column', value)],
+    staticValues: {
+      auto: [decl('grid-column', 'auto')],
+    },
   })
-  staticUtility('col-span-full', [['grid-column', '1 / -1']])
+
   functionalUtility('col-span', {
     handleBareValue: ({ value }) => {
       if (!isPositiveInteger(value)) return null
       return value
     },
     handle: (value) => [decl('grid-column', `span ${value} / span ${value}`)],
+    staticValues: {
+      full: [decl('grid-column', '1 / -1')],
+    },
   })
 
   /**
    * @css `grid-column-start`
    */
-  staticUtility('col-start-auto', [['grid-column-start', 'auto']])
   functionalUtility('col-start', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -701,12 +743,14 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-column-start'],
     handle: (value) => [decl('grid-column-start', value)],
+    staticValues: {
+      auto: [decl('grid-column-start', 'auto')],
+    },
   })
 
   /**
    * @css `grid-column-end`
    */
-  staticUtility('col-end-auto', [['grid-column-end', 'auto']])
   functionalUtility('col-end', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -715,6 +759,9 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-column-end'],
     handle: (value) => [decl('grid-column-end', value)],
+    staticValues: {
+      auto: [decl('grid-column-end', 'auto')],
+    },
   })
 
   suggest('col-span', () => [
@@ -743,7 +790,6 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `grid-row`
    */
-  staticUtility('row-auto', [['grid-row', 'auto']])
   functionalUtility('row', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -752,8 +798,11 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-row'],
     handle: (value) => [decl('grid-row', value)],
+    staticValues: {
+      auto: [decl('grid-row', 'auto')],
+    },
   })
-  staticUtility('row-span-full', [['grid-row', '1 / -1']])
+
   functionalUtility('row-span', {
     themeKeys: [],
     handleBareValue: ({ value }) => {
@@ -761,12 +810,14 @@ export function createUtilities(theme: Theme) {
       return value
     },
     handle: (value) => [decl('grid-row', `span ${value} / span ${value}`)],
+    staticValues: {
+      full: [decl('grid-row', '1 / -1')],
+    },
   })
 
   /**
    * @css `grid-row-start`
    */
-  staticUtility('row-start-auto', [['grid-row-start', 'auto']])
   functionalUtility('row-start', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -775,12 +826,14 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-row-start'],
     handle: (value) => [decl('grid-row-start', value)],
+    staticValues: {
+      auto: [decl('grid-row-start', 'auto')],
+    },
   })
 
   /**
    * @css `grid-row-end`
    */
-  staticUtility('row-end-auto', [['grid-row-end', 'auto']])
   functionalUtility('row-end', {
     supportsNegative: true,
     handleBareValue: ({ value }) => {
@@ -789,6 +842,9 @@ export function createUtilities(theme: Theme) {
     },
     themeKeys: ['--grid-row-end'],
     handle: (value) => [decl('grid-row-end', value)],
+    staticValues: {
+      auto: [decl('grid-row-end', 'auto')],
+    },
   })
 
   suggest('row-span', () => [
@@ -842,6 +898,8 @@ export function createUtilities(theme: Theme) {
     ['my', 'margin-block'],
     ['ms', 'margin-inline-start'],
     ['me', 'margin-inline-end'],
+    ['mbs', 'margin-block-start'],
+    ['mbe', 'margin-block-end'],
     ['mt', 'margin-top'],
     ['mr', 'margin-right'],
     ['mb', 'margin-bottom'],
@@ -862,12 +920,6 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `line-clamp`
    */
-  staticUtility('line-clamp-none', [
-    ['overflow', 'visible'],
-    ['display', 'block'],
-    ['-webkit-box-orient', 'horizontal'],
-    ['-webkit-line-clamp', 'unset'],
-  ])
   functionalUtility('line-clamp', {
     themeKeys: ['--line-clamp'],
     handleBareValue: ({ value }) => {
@@ -880,6 +932,14 @@ export function createUtilities(theme: Theme) {
       decl('-webkit-box-orient', 'vertical'),
       decl('-webkit-line-clamp', value),
     ],
+    staticValues: {
+      none: [
+        decl('overflow', 'visible'),
+        decl('display', 'block'),
+        decl('-webkit-box-orient', 'horizontal'),
+        decl('-webkit-line-clamp', 'unset'),
+      ],
+    },
   })
 
   suggest('line-clamp', () => [
@@ -924,17 +984,19 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `aspect-ratio`
    */
-  staticUtility('aspect-auto', [['aspect-ratio', 'auto']])
-  staticUtility('aspect-square', [['aspect-ratio', '1 / 1']])
   functionalUtility('aspect', {
     themeKeys: ['--aspect'],
     handleBareValue: ({ fraction }) => {
       if (fraction === null) return null
       let [lhs, rhs] = segment(fraction, '/')
-      if (!isPositiveInteger(lhs) || !isPositiveInteger(rhs)) return null
+      if (!isValidSpacingMultiplier(lhs) || !isValidSpacingMultiplier(rhs)) return null
       return fraction
     },
     handle: (value) => [decl('aspect-ratio', value)],
+    staticValues: {
+      auto: [decl('aspect-ratio', 'auto')],
+      square: [decl('aspect-ratio', '1 / 1')],
+    },
   })
 
   /**
@@ -1011,6 +1073,82 @@ export function createUtilities(theme: Theme) {
     ['h', ['--height', '--spacing'], 'height'],
     ['min-h', ['--min-height', '--height', '--spacing'], 'min-height'],
     ['max-h', ['--max-height', '--height', '--spacing'], 'max-height'],
+  ] as [string, ThemeKey[], string][]) {
+    spacingUtility(name, namespaces, (value) => [decl(property, value)], {
+      supportsFractions: true,
+    })
+  }
+
+  /**
+   * @css `inline-size`
+   * @css `min-inline-size`
+   * @css `max-inline-size`
+   * @css `block-size`
+   * @css `min-block-size`
+   * @css `max-block-size`
+   */
+  for (let [key, value] of [
+    ['full', '100%'],
+    ['min', 'min-content'],
+    ['max', 'max-content'],
+    ['fit', 'fit-content'],
+  ]) {
+    staticUtility(`inline-${key}`, [['inline-size', value]])
+    staticUtility(`block-${key}`, [['block-size', value]])
+    staticUtility(`min-inline-${key}`, [['min-inline-size', value]])
+    staticUtility(`min-block-${key}`, [['min-block-size', value]])
+    staticUtility(`max-inline-${key}`, [['max-inline-size', value]])
+    staticUtility(`max-block-${key}`, [['max-block-size', value]])
+  }
+
+  // inline-size viewport units (like width)
+  for (let [key, value] of [
+    ['svw', '100svw'],
+    ['lvw', '100lvw'],
+    ['dvw', '100dvw'],
+  ]) {
+    staticUtility(`inline-${key}`, [['inline-size', value]])
+    staticUtility(`min-inline-${key}`, [['min-inline-size', value]])
+    staticUtility(`max-inline-${key}`, [['max-inline-size', value]])
+  }
+
+  // block-size viewport units (like height)
+  for (let [key, value] of [
+    ['svh', '100svh'],
+    ['lvh', '100lvh'],
+    ['dvh', '100dvh'],
+  ]) {
+    staticUtility(`block-${key}`, [['block-size', value]])
+    staticUtility(`min-block-${key}`, [['min-block-size', value]])
+    staticUtility(`max-block-${key}`, [['max-block-size', value]])
+  }
+
+  staticUtility(`inline-auto`, [['inline-size', 'auto']])
+  staticUtility(`block-auto`, [['block-size', 'auto']])
+  staticUtility(`min-inline-auto`, [['min-inline-size', 'auto']])
+  staticUtility(`min-block-auto`, [['min-block-size', 'auto']])
+
+  staticUtility(`block-lh`, [['block-size', '1lh']])
+  staticUtility(`min-block-lh`, [['min-block-size', '1lh']])
+  staticUtility(`max-block-lh`, [['max-block-size', '1lh']])
+
+  staticUtility(`inline-screen`, [['inline-size', '100vw']])
+  staticUtility(`min-inline-screen`, [['min-inline-size', '100vw']])
+  staticUtility(`max-inline-screen`, [['max-inline-size', '100vw']])
+  staticUtility(`block-screen`, [['block-size', '100vh']])
+  staticUtility(`min-block-screen`, [['min-block-size', '100vh']])
+  staticUtility(`max-block-screen`, [['max-block-size', '100vh']])
+
+  staticUtility(`max-inline-none`, [['max-inline-size', 'none']])
+  staticUtility(`max-block-none`, [['max-block-size', 'none']])
+
+  for (let [name, namespaces, property] of [
+    ['inline', ['--spacing', '--container'], 'inline-size'],
+    ['min-inline', ['--spacing', '--container'], 'min-inline-size'],
+    ['max-inline', ['--spacing', '--container'], 'max-inline-size'],
+    ['block', ['--spacing'], 'block-size'],
+    ['min-block', ['--spacing'], 'min-block-size'],
+    ['max-block', ['--spacing'], 'max-block-size'],
   ] as [string, ThemeKey[], string][]) {
     spacingUtility(name, namespaces, (value) => [decl(property, value)], {
       supportsFractions: true,
@@ -1167,41 +1305,47 @@ export function createUtilities(theme: Theme) {
   /**
    * @css `transform-origin`
    */
-  staticUtility('origin-center', [['transform-origin', 'center']])
-  staticUtility('origin-top', [['transform-origin', 'top']])
-  staticUtility('origin-top-right', [['transform-origin', 'top right']])
-  staticUtility('origin-right', [['transform-origin', 'right']])
-  staticUtility('origin-bottom-right', [['transform-origin', 'bottom right']])
-  staticUtility('origin-bottom', [['transform-origin', 'bottom']])
-  staticUtility('origin-bottom-left', [['transform-origin', 'bottom left']])
-  staticUtility('origin-left', [['transform-origin', 'left']])
-  staticUtility('origin-top-left', [['transform-origin', 'top left']])
   functionalUtility('origin', {
     themeKeys: ['--transform-origin'],
     handle: (value) => [decl('transform-origin', value)],
+    staticValues: {
+      center: [decl('transform-origin', 'center')],
+      top: [decl('transform-origin', 'top')],
+      'top-right': [decl('transform-origin', '100% 0')],
+      right: [decl('transform-origin', '100%')],
+      'bottom-right': [decl('transform-origin', '100% 100%')],
+      bottom: [decl('transform-origin', 'bottom')],
+      'bottom-left': [decl('transform-origin', '0 100%')],
+      left: [decl('transform-origin', '0')],
+      'top-left': [decl('transform-origin', '0 0')],
+    },
   })
 
-  staticUtility('perspective-origin-center', [['perspective-origin', 'center']])
-  staticUtility('perspective-origin-top', [['perspective-origin', 'top']])
-  staticUtility('perspective-origin-top-right', [['perspective-origin', 'top right']])
-  staticUtility('perspective-origin-right', [['perspective-origin', 'right']])
-  staticUtility('perspective-origin-bottom-right', [['perspective-origin', 'bottom right']])
-  staticUtility('perspective-origin-bottom', [['perspective-origin', 'bottom']])
-  staticUtility('perspective-origin-bottom-left', [['perspective-origin', 'bottom left']])
-  staticUtility('perspective-origin-left', [['perspective-origin', 'left']])
-  staticUtility('perspective-origin-top-left', [['perspective-origin', 'top left']])
   functionalUtility('perspective-origin', {
     themeKeys: ['--perspective-origin'],
     handle: (value) => [decl('perspective-origin', value)],
+    staticValues: {
+      center: [decl('perspective-origin', 'center')],
+      top: [decl('perspective-origin', 'top')],
+      'top-right': [decl('perspective-origin', '100% 0')],
+      right: [decl('perspective-origin', '100%')],
+      'bottom-right': [decl('perspective-origin', '100% 100%')],
+      bottom: [decl('perspective-origin', 'bottom')],
+      'bottom-left': [decl('perspective-origin', '0 100%')],
+      left: [decl('perspective-origin', '0')],
+      'top-left': [decl('perspective-origin', '0 0')],
+    },
   })
 
   /**
    * @css `perspective`
    */
-  staticUtility('perspective-none', [['perspective', 'none']])
   functionalUtility('perspective', {
     themeKeys: ['--perspective'],
     handle: (value) => [decl('perspective', value)],
+    staticValues: {
+      none: [decl('perspective', 'none')],
+    },
   })
 
   let translateProperties = () =>
@@ -1564,6 +1708,21 @@ export function createUtilities(theme: Theme) {
   }
 
   /**
+   * @css `zoom`
+   */
+  functionalUtility('zoom', {
+    handleBareValue: ({ value }) => {
+      if (!isPositiveInteger(value)) return null
+      return `${value}%`
+    },
+    handle: (value) => [decl('zoom', value)],
+  })
+
+  suggest('zoom', () => [
+    { values: ['50', '75', '90', '95', '100', '105', '110', '125', '150', '200'] },
+  ])
+
+  /**
    * @css `transform-style`
    */
   staticUtility('transform-flat', [['transform-style', 'flat']])
@@ -1718,6 +1877,8 @@ export function createUtilities(theme: Theme) {
     ['scroll-my', 'scroll-margin-block'],
     ['scroll-ms', 'scroll-margin-inline-start'],
     ['scroll-me', 'scroll-margin-inline-end'],
+    ['scroll-mbs', 'scroll-margin-block-start'],
+    ['scroll-mbe', 'scroll-margin-block-end'],
     ['scroll-mt', 'scroll-margin-top'],
     ['scroll-mr', 'scroll-margin-right'],
     ['scroll-mb', 'scroll-margin-bottom'],
@@ -1742,6 +1903,8 @@ export function createUtilities(theme: Theme) {
     ['scroll-py', 'scroll-padding-block'],
     ['scroll-ps', 'scroll-padding-inline-start'],
     ['scroll-pe', 'scroll-padding-inline-end'],
+    ['scroll-pbs', 'scroll-padding-block-start'],
+    ['scroll-pbe', 'scroll-padding-block-end'],
     ['scroll-pt', 'scroll-padding-top'],
     ['scroll-pr', 'scroll-padding-right'],
     ['scroll-pb', 'scroll-padding-bottom'],
@@ -1753,23 +1916,24 @@ export function createUtilities(theme: Theme) {
   staticUtility('list-inside', [['list-style-position', 'inside']])
   staticUtility('list-outside', [['list-style-position', 'outside']])
 
-  /**
-   * @css `list-style-type`
-   */
-  staticUtility('list-none', [['list-style-type', 'none']])
-  staticUtility('list-disc', [['list-style-type', 'disc']])
-  staticUtility('list-decimal', [['list-style-type', 'decimal']])
   functionalUtility('list', {
     themeKeys: ['--list-style-type'],
     handle: (value) => [decl('list-style-type', value)],
+    staticValues: {
+      none: [decl('list-style-type', 'none')],
+      disc: [decl('list-style-type', 'disc')],
+      decimal: [decl('list-style-type', 'decimal')],
+    },
   })
 
   // list-image-*
 
-  staticUtility('list-image-none', [['list-style-image', 'none']])
   functionalUtility('list-image', {
     themeKeys: ['--list-style-image'],
     handle: (value) => [decl('list-style-image', value)],
+    staticValues: {
+      none: [decl('list-style-image', 'none')],
+    },
   })
 
   staticUtility('appearance-none', [['appearance', 'none']])
@@ -1782,9 +1946,6 @@ export function createUtilities(theme: Theme) {
   staticUtility('scheme-only-dark', [['color-scheme', 'only dark']])
   staticUtility('scheme-only-light', [['color-scheme', 'only light']])
 
-  // columns-*
-  staticUtility('columns-auto', [['columns', 'auto']])
-
   functionalUtility('columns', {
     themeKeys: ['--columns', '--container'],
     handleBareValue: ({ value }) => {
@@ -1792,6 +1953,9 @@ export function createUtilities(theme: Theme) {
       return value
     },
     handle: (value) => [decl('columns', value)],
+    staticValues: {
+      auto: [decl('columns', 'auto')],
+    },
   })
 
   suggest('columns', () => [
@@ -1819,26 +1983,38 @@ export function createUtilities(theme: Theme) {
   staticUtility('grid-flow-row-dense', [['grid-auto-flow', 'row dense']])
   staticUtility('grid-flow-col-dense', [['grid-auto-flow', 'column dense']])
 
-  staticUtility('auto-cols-auto', [['grid-auto-columns', 'auto']])
-  staticUtility('auto-cols-min', [['grid-auto-columns', 'min-content']])
-  staticUtility('auto-cols-max', [['grid-auto-columns', 'max-content']])
-  staticUtility('auto-cols-fr', [['grid-auto-columns', 'minmax(0, 1fr)']])
   functionalUtility('auto-cols', {
     themeKeys: ['--grid-auto-columns'],
+    handleBareValue: ({ value }) => {
+      if (!theme.resolve(null, ['--spacing'])) return null
+      if (!isValidSpacingMultiplier(value)) return null
+      return `--spacing(${value})`
+    },
     handle: (value) => [decl('grid-auto-columns', value)],
+    staticValues: {
+      auto: [decl('grid-auto-columns', 'auto')],
+      min: [decl('grid-auto-columns', 'min-content')],
+      max: [decl('grid-auto-columns', 'max-content')],
+      fr: [decl('grid-auto-columns', 'minmax(0, 1fr)')],
+    },
   })
 
-  staticUtility('auto-rows-auto', [['grid-auto-rows', 'auto']])
-  staticUtility('auto-rows-min', [['grid-auto-rows', 'min-content']])
-  staticUtility('auto-rows-max', [['grid-auto-rows', 'max-content']])
-  staticUtility('auto-rows-fr', [['grid-auto-rows', 'minmax(0, 1fr)']])
   functionalUtility('auto-rows', {
     themeKeys: ['--grid-auto-rows'],
+    handleBareValue: ({ value }) => {
+      if (!theme.resolve(null, ['--spacing'])) return null
+      if (!isValidSpacingMultiplier(value)) return null
+      return `--spacing(${value})`
+    },
     handle: (value) => [decl('grid-auto-rows', value)],
+    staticValues: {
+      auto: [decl('grid-auto-rows', 'auto')],
+      min: [decl('grid-auto-rows', 'min-content')],
+      max: [decl('grid-auto-rows', 'max-content')],
+      fr: [decl('grid-auto-rows', 'minmax(0, 1fr)')],
+    },
   })
 
-  staticUtility('grid-cols-none', [['grid-template-columns', 'none']])
-  staticUtility('grid-cols-subgrid', [['grid-template-columns', 'subgrid']])
   functionalUtility('grid-cols', {
     themeKeys: ['--grid-template-columns'],
     handleBareValue: ({ value }) => {
@@ -1846,10 +2022,12 @@ export function createUtilities(theme: Theme) {
       return `repeat(${value}, minmax(0, 1fr))`
     },
     handle: (value) => [decl('grid-template-columns', value)],
+    staticValues: {
+      none: [decl('grid-template-columns', 'none')],
+      subgrid: [decl('grid-template-columns', 'subgrid')],
+    },
   })
 
-  staticUtility('grid-rows-none', [['grid-template-rows', 'none']])
-  staticUtility('grid-rows-subgrid', [['grid-template-rows', 'subgrid']])
   functionalUtility('grid-rows', {
     themeKeys: ['--grid-template-rows'],
     handleBareValue: ({ value }) => {
@@ -1857,6 +2035,10 @@ export function createUtilities(theme: Theme) {
       return `repeat(${value}, minmax(0, 1fr))`
     },
     handle: (value) => [decl('grid-template-rows', value)],
+    staticValues: {
+      none: [decl('grid-template-rows', 'none')],
+      subgrid: [decl('grid-template-rows', 'subgrid')],
+    },
   })
 
   suggest('grid-cols', () => [
@@ -1949,31 +2131,65 @@ export function createUtilities(theme: Theme) {
   spacingUtility(
     'space-x',
     ['--space', '--spacing'],
-    (value) => [
-      atRoot([property('--tw-space-x-reverse', '0')]),
+    (value) => {
+      let zero = (() => {
+        if (value === '--spacing(0)') return true
+        if (value === '--spacing(-0)') return true
 
-      styleRule(':where(& > :not(:last-child))', [
-        decl('--tw-sort', 'row-gap'),
-        decl('--tw-space-x-reverse', '0'),
-        decl('margin-inline-start', `calc(${value} * var(--tw-space-x-reverse))`),
-        decl('margin-inline-end', `calc(${value} * calc(1 - var(--tw-space-x-reverse)))`),
-      ]),
-    ],
+        let parsed = dimensions.get(value)
+        if (parsed && parsed[0] === 0 && (parsed[1] === null || isLength(value))) {
+          return true
+        }
+
+        return false
+      })()
+
+      return [
+        atRoot([property('--tw-space-x-reverse', '0')]),
+
+        styleRule(':where(& > :not(:last-child))', [
+          decl('--tw-sort', 'row-gap'),
+          decl('--tw-space-x-reverse', '0'),
+          decl('margin-inline-start', zero ? '0' : `calc(${value} * var(--tw-space-x-reverse))`),
+          decl(
+            'margin-inline-end',
+            zero ? '0' : `calc(${value} * calc(1 - var(--tw-space-x-reverse)))`,
+          ),
+        ]),
+      ]
+    },
     { supportsNegative: true },
   )
 
   spacingUtility(
     'space-y',
     ['--space', '--spacing'],
-    (value) => [
-      atRoot([property('--tw-space-y-reverse', '0')]),
-      styleRule(':where(& > :not(:last-child))', [
-        decl('--tw-sort', 'column-gap'),
-        decl('--tw-space-y-reverse', '0'),
-        decl('margin-block-start', `calc(${value} * var(--tw-space-y-reverse))`),
-        decl('margin-block-end', `calc(${value} * calc(1 - var(--tw-space-y-reverse)))`),
-      ]),
-    ],
+    (value) => {
+      let zero = (() => {
+        if (value === '--spacing(0)') return true
+        if (value === '--spacing(-0)') return true
+
+        let parsed = dimensions.get(value)
+        if (parsed && parsed[0] === 0 && (parsed[1] === null || isLength(value))) {
+          return true
+        }
+
+        return false
+      })()
+
+      return [
+        atRoot([property('--tw-space-y-reverse', '0')]),
+        styleRule(':where(& > :not(:last-child))', [
+          decl('--tw-sort', 'column-gap'),
+          decl('--tw-space-y-reverse', '0'),
+          decl('margin-block-start', zero ? '0' : `calc(${value} * var(--tw-space-y-reverse))`),
+          decl(
+            'margin-block-end',
+            zero ? '0' : `calc(${value} * calc(1 - var(--tw-space-y-reverse)))`,
+          ),
+        ]),
+      ]
+    },
     { supportsNegative: true },
   )
 
@@ -2057,6 +2273,41 @@ export function createUtilities(theme: Theme) {
   staticUtility('scroll-auto', [['scroll-behavior', 'auto']])
   staticUtility('scroll-smooth', [['scroll-behavior', 'smooth']])
 
+  staticUtility('scrollbar-auto', [['scrollbar-width', 'auto']])
+  staticUtility('scrollbar-thin', [['scrollbar-width', 'thin']])
+  staticUtility('scrollbar-none', [['scrollbar-width', 'none']])
+
+  {
+    let scrollbarColorProperties = () => {
+      return atRoot([
+        property('--tw-scrollbar-thumb', '#0000', '<color>'),
+        property('--tw-scrollbar-track', '#0000', '<color>'),
+      ])
+    }
+
+    colorUtility('scrollbar-thumb', {
+      themeKeys: ['--color'],
+      handle: (value) => [
+        scrollbarColorProperties(),
+        decl('--tw-scrollbar-thumb', value),
+        decl('scrollbar-color', 'var(--tw-scrollbar-thumb) var(--tw-scrollbar-track)'),
+      ],
+    })
+
+    colorUtility('scrollbar-track', {
+      themeKeys: ['--color'],
+      handle: (value) => [
+        scrollbarColorProperties(),
+        decl('--tw-scrollbar-track', value),
+        decl('scrollbar-color', 'var(--tw-scrollbar-thumb) var(--tw-scrollbar-track)'),
+      ],
+    })
+  }
+
+  staticUtility('scrollbar-gutter-auto', [['scrollbar-gutter', 'auto']])
+  staticUtility('scrollbar-gutter-stable', [['scrollbar-gutter', 'stable']])
+  staticUtility('scrollbar-gutter-both', [['scrollbar-gutter', 'stable both-edges']])
+
   staticUtility('truncate', [
     ['overflow', 'hidden'],
     ['text-overflow', 'ellipsis'],
@@ -2086,6 +2337,16 @@ export function createUtilities(theme: Theme) {
   staticUtility('whitespace-pre-wrap', [['white-space', 'pre-wrap']])
   staticUtility('whitespace-break-spaces', [['white-space', 'break-spaces']])
 
+  functionalUtility('tab', {
+    handleBareValue: ({ value }) => {
+      if (!isPositiveInteger(value)) return null
+      return value
+    },
+    handle: (value) => [decl('tab-size', value)],
+  })
+
+  suggest('tab', () => [{ values: ['2', '4', '8'] }])
+
   staticUtility('text-wrap', [['text-wrap', 'wrap']])
   staticUtility('text-nowrap', [['text-wrap', 'nowrap']])
   staticUtility('text-balance', [['text-wrap', 'balance']])
@@ -2094,7 +2355,6 @@ export function createUtilities(theme: Theme) {
     ['overflow-wrap', 'normal'],
     ['word-break', 'normal'],
   ])
-  staticUtility('break-words', [['overflow-wrap', 'break-word']])
   staticUtility('break-all', [['word-break', 'break-all']])
   staticUtility('break-keep', [['word-break', 'keep-all']])
 
@@ -2121,17 +2381,13 @@ export function createUtilities(theme: Theme) {
       ['rounded-br', ['border-bottom-right-radius']],
       ['rounded-bl', ['border-bottom-left-radius']],
     ] as const) {
-      staticUtility(
-        `${root}-none`,
-        properties.map((property) => [property, '0']),
-      )
-      staticUtility(
-        `${root}-full`,
-        properties.map((property) => [property, 'calc(infinity * 1px)']),
-      )
       functionalUtility(root, {
         themeKeys: ['--radius'],
         handle: (value) => properties.map((property) => decl(property, value)),
+        staticValues: {
+          none: properties.map((property) => decl(property, '0')),
+          full: properties.map((property) => decl(property, 'calc(infinity * 1px)')),
+        },
       })
     }
   }
@@ -2282,6 +2538,22 @@ export function createUtilities(theme: Theme) {
         decl('border-inline-end-width', value),
       ],
       color: (value) => [decl('border-inline-end-color', value)],
+    })
+
+    borderSideUtility('border-bs', {
+      width: (value) => [
+        decl('border-block-start-style', 'var(--tw-border-style)'),
+        decl('border-block-start-width', value),
+      ],
+      color: (value) => [decl('border-block-start-color', value)],
+    })
+
+    borderSideUtility('border-be', {
+      width: (value) => [
+        decl('border-block-end-style', 'var(--tw-border-style)'),
+        decl('border-block-end-width', value),
+      ],
+      color: (value) => [decl('border-block-end-color', value)],
     })
 
     borderSideUtility('border-t', {
@@ -3015,7 +3287,7 @@ export function createUtilities(theme: Theme) {
             if (!multiplier) return
             if (!isValidSpacingMultiplier(candidate.value.value)) return
 
-            return desc.position(`calc(${multiplier} * ${candidate.value.value})`)
+            return desc.position(`--spacing(${candidate.value.value})`)
           }
 
           case 'percentage': {
@@ -3190,13 +3462,19 @@ export function createUtilities(theme: Theme) {
     defaultValue: null,
     supportsNegative: true,
     supportsFractions: false,
-    handleBareValue(value) {
-      if (!isPositiveInteger(value.value)) return null
-      return `calc(1deg * ${value.value})`
+    handleBareValue({ value }) {
+      if (!isPositiveInteger(value)) return null
+      let valueAsNumber = Number(value)
+      if (valueAsNumber === 0) return '0deg'
+      if (valueAsNumber === 1) return '1deg'
+      return `calc(1deg * ${value})`
     },
-    handleNegativeBareValue(value) {
-      if (!isPositiveInteger(value.value)) return null
-      return `calc(1deg * -${value.value})`
+    handleNegativeBareValue({ value }) {
+      if (!isPositiveInteger(value)) return null
+      let valueAsNumber = Number(value)
+      if (valueAsNumber === 0) return '0deg'
+      if (valueAsNumber === 1) return '-1deg'
+      return `calc(1deg * -${value})`
     },
     handle: (value) => [
       maskPropertiesGradient(),
@@ -3408,13 +3686,19 @@ export function createUtilities(theme: Theme) {
     defaultValue: null,
     supportsNegative: true,
     supportsFractions: false,
-    handleBareValue(value) {
-      if (!isPositiveInteger(value.value)) return null
-      return `calc(1deg * ${value.value})`
+    handleBareValue({ value }) {
+      if (!isPositiveInteger(value)) return null
+      let valueAsNumber = Number(value)
+      if (valueAsNumber === 0) return '0deg'
+      if (valueAsNumber === 1) return '1deg'
+      return `calc(1deg * ${value})`
     },
-    handleNegativeBareValue(value) {
-      if (!isPositiveInteger(value.value)) return null
-      return `calc(1deg * -${value.value})`
+    handleNegativeBareValue({ value }) {
+      if (!isPositiveInteger(value)) return null
+      let valueAsNumber = Number(value)
+      if (valueAsNumber === 0) return '0deg'
+      if (valueAsNumber === 1) return '-1deg'
+      return `calc(1deg * -${value})`
     },
     handle: (value) => [
       maskPropertiesGradient(),
@@ -3624,18 +3908,20 @@ export function createUtilities(theme: Theme) {
   staticUtility('object-none', [['object-fit', 'none']])
   staticUtility('object-scale-down', [['object-fit', 'scale-down']])
 
-  staticUtility('object-top', [['object-position', 'top']])
-  staticUtility('object-top-left', [['object-position', 'left top']])
-  staticUtility('object-top-right', [['object-position', 'right top']])
-  staticUtility('object-bottom', [['object-position', 'bottom']])
-  staticUtility('object-bottom-left', [['object-position', 'left bottom']])
-  staticUtility('object-bottom-right', [['object-position', 'right bottom']])
-  staticUtility('object-left', [['object-position', 'left']])
-  staticUtility('object-right', [['object-position', 'right']])
-  staticUtility('object-center', [['object-position', 'center']])
   functionalUtility('object', {
     themeKeys: ['--object-position'],
     handle: (value) => [decl('object-position', value)],
+    staticValues: {
+      top: [decl('object-position', 'top')],
+      'top-left': [decl('object-position', 'left top')],
+      'top-right': [decl('object-position', 'right top')],
+      bottom: [decl('object-position', 'bottom')],
+      'bottom-left': [decl('object-position', 'left bottom')],
+      'bottom-right': [decl('object-position', 'right bottom')],
+      left: [decl('object-position', 'left')],
+      right: [decl('object-position', 'right')],
+      center: [decl('object-position', 'center')],
+    },
   })
 
   for (let [name, property] of [
@@ -3644,6 +3930,8 @@ export function createUtilities(theme: Theme) {
     ['py', 'padding-block'],
     ['ps', 'padding-inline-start'],
     ['pe', 'padding-inline-end'],
+    ['pbs', 'padding-block-start'],
+    ['pbe', 'padding-block-end'],
     ['pt', 'padding-top'],
     ['pr', 'padding-right'],
     ['pb', 'padding-bottom'],
@@ -3745,6 +4033,14 @@ export function createUtilities(theme: Theme) {
     },
   ])
 
+  /**
+   * @css `font-feature-settings`
+   */
+  functionalUtility('font-features', {
+    themeKeys: [],
+    handle: (value) => [decl('font-feature-settings', value)],
+  })
+
   staticUtility('uppercase', [['text-transform', 'uppercase']])
   staticUtility('lowercase', [['text-transform', 'lowercase']])
   staticUtility('capitalize', [['text-transform', 'capitalize']])
@@ -3785,7 +4081,7 @@ export function createUtilities(theme: Theme) {
   ])
 
   colorUtility('placeholder', {
-    themeKeys: ['--background-color', '--color'],
+    themeKeys: ['--placeholder-color', '--color'],
     handle: (value) => [
       styleRule('&::placeholder', [decl('--tw-sort', 'placeholder-color'), decl('color', value)]),
     ],
@@ -3863,10 +4159,12 @@ export function createUtilities(theme: Theme) {
     },
   ])
 
-  staticUtility('animate-none', [['animation', 'none']])
   functionalUtility('animate', {
     themeKeys: ['--animate'],
     handle: (value) => [decl('animation', value)],
+    staticValues: {
+      none: [decl('animation', 'none')],
+    },
   })
 
   {
@@ -3974,9 +4272,10 @@ export function createUtilities(theme: Theme) {
         decl('--tw-blur', `blur(${value})`),
         decl('filter', cssFilterValue),
       ],
+      staticValues: {
+        none: [filterProperties(), decl('--tw-blur', ' '), decl('filter', cssFilterValue)],
+      },
     })
-
-    staticUtility('blur-none', [filterProperties, ['--tw-blur', ' '], ['filter', cssFilterValue]])
 
     functionalUtility('backdrop-blur', {
       themeKeys: ['--backdrop-blur', '--blur'],
@@ -3986,14 +4285,15 @@ export function createUtilities(theme: Theme) {
         decl('-webkit-backdrop-filter', cssBackdropFilterValue),
         decl('backdrop-filter', cssBackdropFilterValue),
       ],
+      staticValues: {
+        none: [
+          backdropFilterProperties(),
+          decl('--tw-backdrop-blur', ' '),
+          decl('-webkit-backdrop-filter', cssBackdropFilterValue),
+          decl('backdrop-filter', cssBackdropFilterValue),
+        ],
+      },
     })
-
-    staticUtility('backdrop-blur-none', [
-      backdropFilterProperties,
-      ['--tw-backdrop-blur', ' '],
-      ['-webkit-backdrop-filter', cssBackdropFilterValue],
-      ['backdrop-filter', cssBackdropFilterValue],
-    ])
 
     functionalUtility('brightness', {
       themeKeys: ['--brightness'],
@@ -4472,45 +4772,46 @@ export function createUtilities(theme: Theme) {
     let defaultTimingFunction = `var(--tw-ease, ${theme.resolve(null, ['--default-transition-timing-function']) ?? 'ease'})`
     let defaultDuration = `var(--tw-duration, ${theme.resolve(null, ['--default-transition-duration']) ?? '0s'})`
 
-    staticUtility('transition-none', [['transition-property', 'none']])
-    staticUtility('transition-all', [
-      ['transition-property', 'all'],
-      ['transition-timing-function', defaultTimingFunction],
-      ['transition-duration', defaultDuration],
-    ])
-    staticUtility('transition-colors', [
-      [
-        'transition-property',
-        'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to',
-      ],
-      ['transition-timing-function', defaultTimingFunction],
-      ['transition-duration', defaultDuration],
-    ])
-    staticUtility('transition-opacity', [
-      ['transition-property', 'opacity'],
-      ['transition-timing-function', defaultTimingFunction],
-      ['transition-duration', defaultDuration],
-    ])
-    staticUtility('transition-shadow', [
-      ['transition-property', 'box-shadow'],
-      ['transition-timing-function', defaultTimingFunction],
-      ['transition-duration', defaultDuration],
-    ])
-    staticUtility('transition-transform', [
-      ['transition-property', 'transform, translate, scale, rotate'],
-      ['transition-timing-function', defaultTimingFunction],
-      ['transition-duration', defaultDuration],
-    ])
-
     functionalUtility('transition', {
       defaultValue:
-        'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to, opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter, backdrop-filter, display, visibility, content-visibility, overlay, pointer-events',
+        'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to, opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter, backdrop-filter, display, content-visibility, overlay, pointer-events',
       themeKeys: ['--transition-property'],
       handle: (value) => [
         decl('transition-property', value),
         decl('transition-timing-function', defaultTimingFunction),
         decl('transition-duration', defaultDuration),
       ],
+      staticValues: {
+        none: [decl('transition-property', 'none')],
+        all: [
+          decl('transition-property', 'all'),
+          decl('transition-timing-function', defaultTimingFunction),
+          decl('transition-duration', defaultDuration),
+        ],
+        colors: [
+          decl(
+            'transition-property',
+            'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to',
+          ),
+          decl('transition-timing-function', defaultTimingFunction),
+          decl('transition-duration', defaultDuration),
+        ],
+        opacity: [
+          decl('transition-property', 'opacity'),
+          decl('transition-timing-function', defaultTimingFunction),
+          decl('transition-duration', defaultDuration),
+        ],
+        shadow: [
+          decl('transition-property', 'box-shadow'),
+          decl('transition-timing-function', defaultTimingFunction),
+          decl('transition-duration', defaultDuration),
+        ],
+        transform: [
+          decl('transition-property', 'transform, translate, scale, rotate'),
+          decl('transition-timing-function', defaultTimingFunction),
+          decl('transition-duration', defaultDuration),
+        ],
+      },
     })
 
     staticUtility('transition-discrete', [['transition-behavior', 'allow-discrete']])
@@ -4586,12 +4887,6 @@ export function createUtilities(theme: Theme) {
       return atRoot([property('--tw-ease')])
     }
 
-    staticUtility('ease-initial', [transitionTimingFunctionProperty, ['--tw-ease', 'initial']])
-    staticUtility('ease-linear', [
-      transitionTimingFunctionProperty,
-      ['--tw-ease', 'linear'],
-      ['transition-timing-function', 'linear'],
-    ])
     functionalUtility('ease', {
       themeKeys: ['--ease'],
       handle: (value) => [
@@ -4599,6 +4894,14 @@ export function createUtilities(theme: Theme) {
         decl('--tw-ease', value),
         decl('transition-timing-function', value),
       ],
+      staticValues: {
+        initial: [transitionTimingFunctionProperty(), decl('--tw-ease', 'initial')],
+        linear: [
+          transitionTimingFunctionProperty(),
+          decl('--tw-ease', 'linear'),
+          decl('transition-timing-function', 'linear'),
+        ],
+      },
     })
   }
 
@@ -4616,7 +4919,9 @@ export function createUtilities(theme: Theme) {
     ['content', 'none'],
   ])
   functionalUtility('content', {
-    themeKeys: [],
+    // BC: We only read from the `--content` theme key for compatibility reasons. It's recommended
+    // to use the utility with arbitrary values instead.
+    themeKeys: ['--content'],
     handle: (value) => [
       atRoot([property('--tw-content', '""')]),
       decl('--tw-content', value),
@@ -4679,16 +4984,24 @@ export function createUtilities(theme: Theme) {
   staticUtility('forced-color-adjust-none', [['forced-color-adjust', 'none']])
   staticUtility('forced-color-adjust-auto', [['forced-color-adjust', 'auto']])
 
-  staticUtility('leading-none', [
-    () => atRoot([property('--tw-leading')]),
-    ['--tw-leading', '1'],
-    ['line-height', '1'],
-  ])
-  spacingUtility('leading', ['--leading', '--spacing'], (value) => [
-    atRoot([property('--tw-leading')]),
-    decl('--tw-leading', value),
-    decl('line-height', value),
-  ])
+  spacingUtility(
+    'leading',
+    ['--leading', '--spacing'],
+    (value) => [
+      atRoot([property('--tw-leading')]),
+      decl('--tw-leading', value),
+      decl('line-height', value),
+    ],
+    {
+      staticValues: {
+        none: [
+          atRoot([property('--tw-leading')]),
+          decl('--tw-leading', '1'),
+          decl('line-height', '1'),
+        ],
+      },
+    },
+  )
 
   functionalUtility('tracking', {
     supportsNegative: true,
@@ -4927,7 +5240,6 @@ export function createUtilities(theme: Theme) {
     },
   ])
 
-  staticUtility('underline-offset-auto', [['text-underline-offset', 'auto']])
   functionalUtility('underline-offset', {
     supportsNegative: true,
     themeKeys: ['--text-underline-offset'],
@@ -4936,6 +5248,9 @@ export function createUtilities(theme: Theme) {
       return `${value}px`
     },
     handle: (value) => [decl('text-underline-offset', value)],
+    staticValues: {
+      auto: [decl('text-underline-offset', 'auto')],
+    },
   })
 
   suggest('underline-offset', () => [
@@ -4970,7 +5285,7 @@ export function createUtilities(theme: Theme) {
             if (!modifier && isValidSpacingMultiplier(candidate.modifier.value)) {
               let multiplier = theme.resolve(null, ['--spacing'])
               if (!multiplier) return null
-              modifier = `calc(${multiplier} * ${candidate.modifier.value})`
+              modifier = `--spacing(${candidate.modifier.value})`
             }
 
             // Shorthand for `leading-none`
@@ -5023,7 +5338,7 @@ export function createUtilities(theme: Theme) {
           if (!modifier && isValidSpacingMultiplier(candidate.modifier.value)) {
             let multiplier = theme.resolve(null, ['--spacing'])
             if (!multiplier) return null
-            modifier = `calc(${multiplier} * ${candidate.modifier.value})`
+            modifier = `--spacing(${candidate.modifier.value})`
           }
 
           // Shorthand for `leading-none`
@@ -5416,7 +5731,7 @@ export function createUtilities(theme: Theme) {
                 value,
                 alpha,
                 (color) => `var(--tw-inset-shadow-color, ${color})`,
-                'inset ',
+                'inset',
               ),
               decl('box-shadow', cssBoxShadowValue),
             ]
@@ -5429,7 +5744,7 @@ export function createUtilities(theme: Theme) {
           if (candidate.modifier) return
           return [
             boxShadowProperties(),
-            decl('--tw-inset-shadow', nullShadow),
+            decl('--tw-inset-shadow', `inset ${nullShadow}`),
             decl('box-shadow', cssBoxShadowValue),
           ]
 
@@ -5709,6 +6024,8 @@ export function createUtilities(theme: Theme) {
       value = candidate.value.value
     } else if (candidate.value.kind === 'named' && candidate.value.value === 'normal') {
       value = 'normal'
+    } else if (candidate.value.kind === 'named' && candidate.value.value === 'size') {
+      value = 'size'
     }
 
     if (value === null) return
@@ -5742,16 +6059,22 @@ export const BARE_VALUE_DATA_TYPES = [
 ]
 
 export function createCssUtility(node: AtRule) {
-  let name = node.params
+  // Allow escaped characters in the name for compatibility with formatters and
+  // other parsers, to ensure valid CSS syntax. E.g.: `@utility foo-1\/2`.
+  //
+  // Note: the actual utility will be `foo-1/2`
+  let name = unescape(node.params)
 
   // Functional utilities. E.g.: `tab-size-*`
-  if (IS_VALID_FUNCTIONAL_UTILITY_NAME.test(name)) {
+  if (isValidFunctionalUtilityName(name)) {
     // API:
     //
     // - `--value('literal')`         resolves a literal named value
     // - `--value(number)`            resolves a bare value of type number
     // - `--value([number])`          resolves an arbitrary value of type number
     // - `--value(--color)`           resolves a theme value in the `color` namespace
+    // - `--value(--default(4))`      resolves to a default value when only the
+    //                                root of the functional utility was used.
     // - `--value(number, [number])`  resolves a bare value of type number or an
     //                                arbitrary value of type number in order.
     //
@@ -5811,7 +6134,7 @@ export function createCssUtility(node: AtRule) {
         //
         // Once Prettier / Biome handle these better (e.g.: not crashing without
         // `\\*` or not inserting whitespace) then most of these can go away.
-        ValueParser.walk(declarationValueAst, (fn) => {
+        walk(declarationValueAst, (fn) => {
           if (fn.kind !== 'function') return
 
           // Track usage of `--spacing(…)`
@@ -5821,7 +6144,7 @@ export function createCssUtility(node: AtRule) {
             // using the full `--spacing` theme scale.
             !(storage['--modifier'].usedSpacingNumber && storage['--value'].usedSpacingNumber)
           ) {
-            ValueParser.walk(fn.nodes, (node) => {
+            walk(fn.nodes, (node) => {
               if (node.kind !== 'function') return
               if (node.value !== '--value' && node.value !== '--modifier') return
               const key = node.value
@@ -5840,12 +6163,12 @@ export function createCssUtility(node: AtRule) {
                     storage['--modifier'].usedSpacingNumber &&
                     storage['--value'].usedSpacingNumber
                   ) {
-                    return ValueParser.ValueWalkAction.Stop
+                    return WalkAction.Stop
                   }
                 }
               }
             })
-            return ValueParser.ValueWalkAction.Continue
+            return WalkAction.Continue
           }
 
           if (fn.value !== '--value' && fn.value !== '--modifier') return
@@ -5865,7 +6188,7 @@ export function createCssUtility(node: AtRule) {
             arg = arg.replace(/(-\*){2,}/g, '-*')
 
             // Ensure trailing `-*` exists if `-*` isn't present yet
-            if (arg[0] === '-' && arg[1] === '-' && !arg.includes('-*')) {
+            if (arg[0] === '-' && arg[1] === '-' && !arg.includes('(') && !arg.includes('-*')) {
               arg += '-*'
             }
 
@@ -5904,9 +6227,9 @@ export function createCssUtility(node: AtRule) {
               let dataType = node.value
               let copy = structuredClone(fn)
               let sentinelValue = '¶'
-              ValueParser.walk(copy.nodes, (node, { replaceWith }) => {
+              walk(copy.nodes, (node) => {
                 if (node.kind === 'word' && node.value === dataType) {
-                  replaceWith({ kind: 'word', value: sentinelValue })
+                  return WalkAction.ReplaceSkip({ kind: 'word', value: sentinelValue } as const)
                 }
               })
               let underline = '^'.repeat(ValueParser.toCss([node]).length)
@@ -5926,14 +6249,13 @@ export function createCssUtility(node: AtRule) {
       })
 
       designSystem.utilities.functional(name.slice(0, -2), (candidate) => {
-        let atRule = structuredClone(node)
+        let atRule = cloneAstNode(node)
 
         let value = candidate.value
         let modifier = candidate.modifier
 
-        // A value is required for functional utilities, if you want to accept
-        // just `tab-size`, you'd have to use a static utility.
-        if (value === null) return
+        // Functional CSS utilities must resolve at least one `--value(…)`.
+        // Use `--default(…)` inside `--value(…)` for the omitted-value case.
 
         // Whether `--value(…)` was used
         let usedValueFn = false
@@ -5965,73 +6287,67 @@ export function createCssUtility(node: AtRule) {
         // Whether `--value(ratio)` was resolved
         let resolvedRatioValue = false
 
-        walk([atRule], (node, { parent, replaceWith: replaceDeclarationWith }) => {
+        walk<AstNode>([atRule], (node, ctx) => {
+          let parent = ctx.parent
           if (parent?.kind !== 'rule' && parent?.kind !== 'at-rule') return
           if (node.kind !== 'declaration') return
           if (!node.value) return
 
+          let shouldRemoveDeclaration = false
+
           let valueAst = ValueParser.parse(node.value)
-          let result =
-            ValueParser.walk(valueAst, (valueNode, { replaceWith }) => {
-              if (valueNode.kind !== 'function') return
+          walk(valueAst, (fnNode) => {
+            if (fnNode.kind !== 'function') return
 
-              // Value function, e.g.: `--value(integer)`
-              if (valueNode.value === '--value') {
-                usedValueFn = true
+            // Value function, e.g.: `--value(integer)`
+            if (fnNode.value === '--value') {
+              usedValueFn = true
 
-                let resolved = resolveValueFunction(value, valueNode, designSystem)
-                if (resolved) {
-                  resolvedValueFn = true
-                  if (resolved.ratio) {
-                    resolvedRatioValue = true
-                  } else {
-                    resolvedDeclarations.set(node, parent)
-                  }
-                  replaceWith(resolved.nodes)
-                  return ValueParser.ValueWalkAction.Skip
+              let resolved = resolveValueFunction(value, fnNode, designSystem)
+              if (resolved) {
+                resolvedValueFn = true
+                if (resolved.ratio) {
+                  resolvedRatioValue = true
+                } else {
+                  resolvedDeclarations.set(node, parent)
                 }
-
-                // Drop the declaration in case we couldn't resolve the value
-                usedValueFn ||= false
-                replaceDeclarationWith([])
-                return ValueParser.ValueWalkAction.Stop
+                return WalkAction.ReplaceSkip(resolved.nodes)
               }
 
-              // Modifier function, e.g.: `--modifier(integer)`
-              else if (valueNode.value === '--modifier') {
-                // If there is no modifier present in the candidate, then the
-                // declaration can be removed.
-                if (modifier === null) {
-                  replaceDeclarationWith([])
-                  return ValueParser.ValueWalkAction.Stop
-                }
+              // Drop the declaration in case we couldn't resolve the value
+              shouldRemoveDeclaration = true
+              return WalkAction.Stop
+            }
 
-                usedModifierFn = true
+            // Modifier function, e.g.: `--modifier(integer)`
+            else if (fnNode.value === '--modifier') {
+              usedModifierFn = true
 
-                let replacement = resolveValueFunction(modifier, valueNode, designSystem)
-                if (replacement) {
-                  resolvedModifierFn = true
-                  replaceWith(replacement.nodes)
-                  return ValueParser.ValueWalkAction.Skip
-                }
-
-                // Drop the declaration in case we couldn't resolve the value
-                usedModifierFn ||= false
-                replaceDeclarationWith([])
-                return ValueParser.ValueWalkAction.Stop
+              let resolved = resolveValueFunction(modifier, fnNode, designSystem)
+              if (resolved) {
+                resolvedModifierFn = true
+                return WalkAction.ReplaceSkip(resolved.nodes)
               }
-            }) ?? ValueParser.ValueWalkAction.Continue
 
-          if (result === ValueParser.ValueWalkAction.Continue) {
-            node.value = ValueParser.toCss(valueAst)
+              // Drop the declaration in case we couldn't resolve the value
+              shouldRemoveDeclaration = true
+              return WalkAction.Stop
+            }
+          })
+
+          if (shouldRemoveDeclaration) {
+            return WalkAction.ReplaceSkip([])
           }
+
+          node.value = ValueParser.toCss(valueAst)
         })
 
-        // Used `--value(…)` but nothing resolved
-        if (usedValueFn && !resolvedValueFn) return null
+        // Functional CSS utilities require `--value(…)`, and one of those
+        // branches must resolve for the candidate to be valid.
+        if (!usedValueFn || !resolvedValueFn) return null
 
         // Used `--modifier(…)` but nothing resolved
-        if (usedModifierFn && !resolvedModifierFn) return null
+        if (usedModifierFn && !resolvedModifierFn && modifier !== null) return null
 
         // Resolved `--value(ratio)` and `--modifier(…)`, which is invalid
         if (resolvedRatioValue && resolvedModifierFn) return null
@@ -6092,9 +6408,9 @@ export function createCssUtility(node: AtRule) {
     }
   }
 
-  if (IS_VALID_STATIC_UTILITY_NAME.test(name)) {
+  if (isValidStaticUtilityName(name)) {
     return (designSystem: DesignSystem) => {
-      designSystem.utilities.static(name, () => structuredClone(node.nodes))
+      designSystem.utilities.static(name, () => node.nodes.map(cloneAstNode))
     }
   }
 
@@ -6102,13 +6418,23 @@ export function createCssUtility(node: AtRule) {
 }
 
 function resolveValueFunction(
-  value: NonNullable<
+  value:
     | Extract<Candidate, { kind: 'functional' }>['value']
-    | Extract<Candidate, { kind: 'functional' }>['modifier']
-  >,
+    | Extract<Candidate, { kind: 'functional' }>['modifier'],
   fn: ValueParser.ValueFunctionNode,
   designSystem: DesignSystem,
 ): { nodes: ValueParser.ValueAstNode[]; ratio?: boolean } | undefined {
+  // No value provided, we can try `--default(…)`
+  if (value === null) {
+    for (let arg of fn.nodes) {
+      // Resolve default value, e.g.: `--default(…)`
+      if (arg.kind === 'function' && arg.value === '--default') {
+        return { nodes: arg.nodes }
+      }
+    }
+    return
+  }
+
   for (let arg of fn.nodes) {
     // Resolve literal value, e.g.: `--modifier('closest-side')`
     if (
@@ -6178,7 +6504,7 @@ function resolveValueFunction(
 
       // Ratio must be a valid fraction, e.g.: <integer>/<integer>
       if (type === 'ratio') {
-        let [lhs, rhs] = segment(resolved, '/')
+        let [lhs, rhs] = segment(resolved, '/').map(Number)
         if (!isPositiveInteger(lhs) || !isPositiveInteger(rhs)) continue
       }
 
@@ -6193,7 +6519,12 @@ function resolveValueFunction(
         continue
       }
 
-      return { nodes: ValueParser.parse(resolved), ratio: type === 'ratio' }
+      if (type === 'ratio') {
+        let [lhs, rhs] = segment(resolved, '/')
+        return { nodes: ValueParser.parse(`${lhs.trim()} / ${rhs.trim()}`), ratio: true }
+      }
+
+      return { nodes: ValueParser.parse(resolved), ratio: false }
     }
 
     // Arbitrary value, e.g.: `--value([integer])`
@@ -6272,8 +6603,8 @@ function alphaReplacedShadowProperties(
   function applyPrefix(x: string) {
     if (!prefix) return x
     return segment(x, ',')
-      .map((value) => prefix + value)
-      .join(',')
+      .map((value) => prefix.trim() + ' ' + value.trim())
+      .join(', ')
   }
 
   if (requiresFallback) {
@@ -6335,4 +6666,144 @@ function alphaReplacedDropShadowProperties(
   } else {
     return [decl(property, prefix + replacedValue)]
   }
+}
+
+const UTILITY_ROOT = /^-?[a-z][a-zA-Z0-9_-]*/
+
+const PERCENT = 37
+const SLASH = 47
+const DOT = 46
+const LOWER_A = 97
+const LOWER_Z = 122
+const UPPER_A = 65
+const UPPER_Z = 90
+const ZERO = 48
+const NINE = 57
+const UNDERSCORE = 95
+const DASH = 45
+
+export function isValidStaticUtilityName(name: string): boolean {
+  let match = UTILITY_ROOT.exec(name)
+  if (match === null) return false // Invalid root
+
+  let root = match[0]
+  let value = name.slice(root.length)
+
+  // Root should not end in `-` if there is no value
+  //
+  // `tab-size-`
+  //  ---------     Root
+  if (value.length === 0 && root.endsWith('-')) {
+    return false
+  }
+
+  // No remaining value is valid
+  //
+  // `tab-size`
+  //  --------    Root
+  if (value.length === 0) {
+    return true
+  }
+
+  // Any valid (static) utility should be valid including:
+  // - Bare values with `.`: `p-1.5`
+  // - Bare values with `%`: `w-50%`
+  // - With an embedded modifier: `text-xs/8`
+
+  let seenSlash = false
+  for (let i = 0; i < value.length; i++) {
+    let charCode = value.charCodeAt(i)
+    switch (charCode) {
+      case PERCENT: {
+        // A percentage is only valid at the end of the value
+        if (i !== value.length - 1) return false
+
+        // A percent is only valid when preceded by a digit. E.g.: `w-%` is invalid
+        let previousChar = value[i - 1] || root[root.length - 1] || ''
+        let previousCharCode = previousChar.charCodeAt(0)
+        if (previousCharCode < ZERO || previousCharCode > NINE) return false
+        break
+      }
+
+      case SLASH: {
+        // A slash must be followed by at least 1 character. E.g.: `foo/` is invalid
+        if (i === value.length - 1) return false
+
+        // A slash can only appear once. E.g.: `foo/bar/baz` is invalid
+        if (seenSlash) return false
+        seenSlash = true
+        break
+      }
+
+      case DOT: {
+        // Dots are only allowed between digits. E.g.: `p-1.a` is invalid
+        let previousChar = value[i - 1] || root[root.length - 1] || ''
+        let previousCharCode = previousChar.charCodeAt(0)
+        if (previousCharCode < ZERO || previousCharCode > NINE) return false
+
+        let nextChar = value[i + 1] || ''
+        let nextCharCode = nextChar.charCodeAt(0)
+        if (nextCharCode < ZERO || nextCharCode > NINE) return false
+        break
+      }
+
+      // Allowed special characters
+      case UNDERSCORE:
+      case DASH: {
+        continue
+      }
+
+      default: {
+        if (
+          (charCode >= LOWER_A && charCode <= LOWER_Z) || // Allow a-z
+          (charCode >= UPPER_A && charCode <= UPPER_Z) || // Allow A-Z
+          (charCode >= ZERO && charCode <= NINE) // Allow 0-9
+        ) {
+          continue
+        }
+
+        // Everything else is invalid
+        return false
+      }
+    }
+  }
+
+  return true
+}
+
+export function isValidFunctionalUtilityName(name: string): boolean {
+  if (!name.endsWith('-*')) return false // Missing '-*' suffix
+  name = name.slice(0, -2)
+
+  let match = UTILITY_ROOT.exec(name)
+  if (match === null) return false // Invalid root
+
+  let root = match[0]
+  let value = name.slice(root.length)
+
+  // No remaining value is valid
+  //
+  // `tab-size-*`
+  //  --------    Root
+  //          --  Suffix
+  //
+  // Backwards compatibility: a root ending in `-` was valid and correctly
+  // scanned by Oxide. This means that custom utilities can result in candidates
+  // such as `foo--bar`.
+  //
+  // We might want to revisit this for Tailwind CSS v5, but for now we have to
+  // make it backwards compatible.
+  //
+  // PR: https://github.com/tailwindlabs/tailwindcss/pull/19696
+  //
+  if (value.length === 0) {
+    return true
+  }
+
+  // But if there is a value remaining, it's invalid.
+  //
+  // E.g.: `tab-size-[…]-*`
+  //
+  // If we allow more characters, we can extend the validation here
+  return false
 }

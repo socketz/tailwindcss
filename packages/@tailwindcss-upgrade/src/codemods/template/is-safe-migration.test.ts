@@ -4,10 +4,22 @@ import * as versions from '../../utils/version'
 import { migrateCandidate } from './migrate'
 vi.spyOn(versions, 'isMajor').mockReturnValue(true)
 
+const css = String.raw
+
 describe('is-safe-migration', async () => {
-  let designSystem = await __unstable__loadDesignSystem('@import "tailwindcss";', {
-    base: __dirname,
-  })
+  let designSystem = await __unstable__loadDesignSystem(
+    css`
+      @import 'tailwindcss';
+
+      /* TODO(perf): Only here to speed up the tests */
+      @theme {
+        --*: initial;
+        --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+        --shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+      }
+    `,
+    { base: __dirname },
+  )
 
   test.each([
     [`let notBorder = !border    \n`, '!border'],
@@ -36,6 +48,10 @@ describe('is-safe-migration', async () => {
     [`<div v-show="shadow"></div>\n`, 'shadow'],
     [`<div x-if="shadow"></div>\n`, 'shadow'],
     [`<div style={{filter: 'drop-shadow(30px 10px 4px #4444dd)'}}/>\n`, 'shadow'],
+    [`<div style="flex-grow: 1"></div>\n`, 'flex-grow'],
+    [`<div style='flex-shrink: 0'></div>\n`, 'flex-shrink'],
+    [`<div style="  flex-shrink: 0"></div>\n`, 'flex-shrink'],
+    [`<div style="\nflex-shrink: 0\n"></div>\n`, 'flex-shrink'],
 
     // Next.js Image placeholder cases
     [`<Image placeholder="blur" src="/image.jpg" />`, 'blur'],
@@ -79,7 +95,7 @@ describe('is-safe-migration', async () => {
       'outline',
     ],
     [
-      // As the last argument, but there is techinically another `"` on the same line
+      // As the last argument, but there is technically another `"` on the same line
       `function foo({ size = "1.25rem", digit, outline }): { return "foo" }`,
       'outline',
     ],
@@ -91,6 +107,18 @@ describe('is-safe-migration', async () => {
 
     [`function foo(blur, foo)`, 'blur'],
     [`function foo(blur,foo)`, 'blur'],
+
+    // shadcn/ui variants
+    [`<Button variant="outline" />`, 'outline'],
+    [`<Button variant='outline' />`, 'outline'],
+    [`<Button variant={"outline"} />`, 'outline'],
+    [`<Button variant={'outline'} />`, 'outline'],
+    [`function Button({ variant = "outline" }) {}`, 'outline'],
+    [`function Button({ variant = 'outline' }) {}`, 'outline'],
+    [`function Button({ variant="outline" }) {}`, 'outline'],
+    [`function Button({ variant='outline' }) {}`, 'outline'],
+    [`Button({ variant: "outline" })`, 'outline'],
+    [`Button({ variant: 'outline' })`, 'outline'],
   ])('does not replace classes in invalid positions #%#', async (example, candidate) => {
     expect(
       await migrateCandidate(designSystem, {}, candidate, {
@@ -99,5 +127,28 @@ describe('is-safe-migration', async () => {
         end: example.indexOf(candidate) + candidate.length,
       }),
     ).toEqual(candidate)
+  })
+
+  test.each([
+    // Vue classes
+    [`<div class="shadow"></div>`, 'shadow', 'shadow-sm'],
+    [`<div :class="{ shadow: true }"></div>`, 'shadow', 'shadow-sm'],
+    [`<div enter-class="shadow"></div>`, 'shadow', 'shadow-sm'],
+    [`<div :enter-class="{ shadow: true }"></div>`, 'shadow', 'shadow-sm'],
+
+    // React classes
+    [`<div className="shadow"></div>`, 'shadow', 'shadow-sm'],
+    [`<div enterClassName="shadow"></div>`, 'shadow', 'shadow-sm'],
+
+    // Preact-style
+    [`<div enterClass="shadow"></div>`, 'shadow', 'shadow-sm'],
+  ])('replaces classes in valid positions #%#', async (example, candidate, expected) => {
+    expect(
+      await migrateCandidate(designSystem, {}, candidate, {
+        contents: example,
+        start: example.indexOf(candidate),
+        end: example.indexOf(candidate) + candidate.length,
+      }),
+    ).toEqual(expected)
   })
 })

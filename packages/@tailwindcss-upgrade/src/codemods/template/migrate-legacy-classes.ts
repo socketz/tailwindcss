@@ -1,7 +1,7 @@
 import { __unstable__loadDesignSystem } from '@tailwindcss/node'
 import path from 'node:path'
 import url from 'node:url'
-import type { Candidate } from '../../../../tailwindcss/src/candidate'
+import { cloneCandidate, type Candidate } from '../../../../tailwindcss/src/candidate'
 import type { Config } from '../../../../tailwindcss/src/compat/plugin-api'
 import type { DesignSystem } from '../../../../tailwindcss/src/design-system'
 import { DefaultMap } from '../../../../tailwindcss/src/utils/default-map'
@@ -59,7 +59,7 @@ const THEME_KEYS = new Map([
   ['backdrop-blur-sm', '--backdrop-blur-sm'],
   ['backdrop-blur-xs', '--backdrop-blur-xs'],
 
-  ['ring', '--ring-width'],
+  ['ring', '--default-ring-width'],
   ['ring-3', '--ring-width-3'],
 ])
 
@@ -100,7 +100,7 @@ export async function migrateLegacyClasses(
 
       // Re-apply the variants and important flag from the original candidate.
       // E.g.: `hover:blur!` -> `blur` -> `blur-sm` -> `hover:blur-sm!`
-      let newCandidate = structuredClone(newBaseCandidate) as Candidate
+      let newCandidate = cloneCandidate(newBaseCandidate) as Candidate
       newCandidate.variants = candidate.variants
       newCandidate.important = candidate.important
 

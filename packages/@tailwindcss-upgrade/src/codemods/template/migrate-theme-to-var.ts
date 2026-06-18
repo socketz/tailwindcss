@@ -1,79 +1,16 @@
-import { parseCandidate, type CandidateModifier } from '../../../../tailwindcss/src/candidate'
+import { type CandidateModifier } from '../../../../tailwindcss/src/candidate'
 import { keyPathToCssProperty } from '../../../../tailwindcss/src/compat/apply-config-to-theme'
-import type { Config } from '../../../../tailwindcss/src/compat/plugin-api'
 import type { DesignSystem } from '../../../../tailwindcss/src/design-system'
 import { isValidSpacingMultiplier } from '../../../../tailwindcss/src/utils/infer-data-type'
 import { segment } from '../../../../tailwindcss/src/utils/segment'
 import { toKeyPath } from '../../../../tailwindcss/src/utils/to-key-path'
 import * as ValueParser from '../../../../tailwindcss/src/value-parser'
-import { walkVariants } from '../../utils/walk-variants'
+import { walk, WalkAction } from '../../../../tailwindcss/src/walk'
 
 export const enum Convert {
   All = 0,
   MigrateModifier = 1 << 0,
   MigrateThemeOnly = 1 << 1,
-}
-
-export function migrateThemeToVar(
-  designSystem: DesignSystem,
-  _userConfig: Config | null,
-  rawCandidate: string,
-): string {
-  let convert = createConverter(designSystem)
-
-  for (let candidate of parseCandidate(rawCandidate, designSystem)) {
-    let clone = structuredClone(candidate)
-    let changed = false
-
-    if (clone.kind === 'arbitrary') {
-      let [newValue, modifier] = convert(
-        clone.value,
-        clone.modifier === null ? Convert.MigrateModifier : Convert.All,
-      )
-      if (newValue !== clone.value) {
-        changed = true
-        clone.value = newValue
-
-        if (modifier !== null) {
-          clone.modifier = modifier
-        }
-      }
-    } else if (clone.kind === 'functional' && clone.value?.kind === 'arbitrary') {
-      let [newValue, modifier] = convert(
-        clone.value.value,
-        clone.modifier === null ? Convert.MigrateModifier : Convert.All,
-      )
-      if (newValue !== clone.value.value) {
-        changed = true
-        clone.value.value = newValue
-
-        if (modifier !== null) {
-          clone.modifier = modifier
-        }
-      }
-    }
-
-    // Handle variants
-    for (let [variant] of walkVariants(clone)) {
-      if (variant.kind === 'arbitrary') {
-        let [newValue] = convert(variant.selector, Convert.MigrateThemeOnly)
-        if (newValue !== variant.selector) {
-          changed = true
-          variant.selector = newValue
-        }
-      } else if (variant.kind === 'functional' && variant.value?.kind === 'arbitrary') {
-        let [newValue] = convert(variant.value.value, Convert.MigrateThemeOnly)
-        if (newValue !== variant.value.value) {
-          changed = true
-          variant.value.value = newValue
-        }
-      }
-    }
-
-    return changed ? designSystem.printCandidate(clone) : rawCandidate
-  }
-
-  return rawCandidate
 }
 
 export function createConverter(designSystem: DesignSystem, { prettyPrint = false } = {}) {
@@ -91,7 +28,7 @@ export function createConverter(designSystem: DesignSystem, { prettyPrint = fals
     let themeModifierCount = 0
 
     // Analyze AST
-    ValueParser.walk(ast, (node) => {
+    walk(ast, (node) => {
       if (node.kind !== 'function') return
       if (node.value !== 'theme') return
 
@@ -99,19 +36,19 @@ export function createConverter(designSystem: DesignSystem, { prettyPrint = fals
       themeUsageCount += 1
 
       // Figure out if a modifier is used
-      ValueParser.walk(node.nodes, (child) => {
+      walk(node.nodes, (child) => {
         // If we see a `,`, it means that we have a fallback value
         if (child.kind === 'separator' && child.value.includes(',')) {
-          return ValueParser.ValueWalkAction.Stop
+          return WalkAction.Stop
         }
 
         // If we see a `/`, we have a modifier
-        else if (child.kind === 'separator' && child.value.trim() === '/') {
+        else if (child.kind === 'word' && child.value === '/') {
           themeModifierCount += 1
-          return ValueParser.ValueWalkAction.Stop
+          return WalkAction.Stop
         }
 
-        return ValueParser.ValueWalkAction.Skip
+        return WalkAction.Skip
       })
     })
 
@@ -236,7 +173,7 @@ function substituteFunctionsInValue(
   ast: ValueParser.ValueAstNode[],
   handle: (value: string, fallback?: string) => string | null,
 ) {
-  ValueParser.walk(ast, (node, { parent, replaceWith }) => {
+  walk(ast, (node, ctx) => {
     if (node.kind === 'function' && node.value === 'theme') {
       if (node.nodes.length < 1) return
 
@@ -274,10 +211,10 @@ function substituteFunctionsInValue(
         fallbackValues.length > 0 ? handle(path, ValueParser.toCss(fallbackValues)) : handle(path)
       if (replacement === null) return
 
-      if (parent) {
-        let idx = parent.nodes.indexOf(node) - 1
+      {
+        let idx = ctx.index - 1
         while (idx !== -1) {
-          let previous = parent.nodes[idx]
+          let previous = ctx.siblings[idx]
           // Skip the space separator
           if (previous.kind === 'separator' && previous.value.trim() === '') {
             idx -= 1
@@ -305,7 +242,7 @@ function substituteFunctionsInValue(
         }
       }
 
-      replaceWith(ValueParser.parse(replacement))
+      return WalkAction.Replace(ValueParser.parse(replacement))
     }
   })
 

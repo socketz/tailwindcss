@@ -5,8 +5,9 @@
 // Minor modifications have been made to work with the Tailwind CSS codebase
 
 import * as path from 'node:path'
-import { toCss, walk } from '../../tailwindcss/src/ast'
+import { toCss } from '../../tailwindcss/src/ast'
 import { parse } from '../../tailwindcss/src/css-parser'
+import { walk } from '../../tailwindcss/src/walk'
 import { normalizePath } from './normalize-path'
 
 const cssUrlRE =
@@ -153,7 +154,7 @@ function skipUrlReplacer(rawUrl: string, aliases?: string[]) {
   return (
     isExternalUrl(rawUrl) ||
     isDataUrl(rawUrl) ||
-    !rawUrl[0].match(/[\.a-zA-Z0-9_]/) ||
+    !rawUrl[0].match(/[.a-zA-Z0-9_]/) ||
     functionCallRE.test(rawUrl)
   )
 }

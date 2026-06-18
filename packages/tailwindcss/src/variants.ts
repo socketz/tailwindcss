@@ -1,24 +1,28 @@
+import { Features } from '.'
 import {
-  WalkAction,
   atRoot,
   atRule,
+  cloneAstNode,
   decl,
   rule,
   styleRule,
-  walk,
   type AstNode,
   type AtRule,
   type Rule,
   type StyleRule,
 } from './ast'
 import { type Variant } from './candidate'
+import { applyVariant } from './compile'
+import type { DesignSystem } from './design-system'
 import type { Theme } from './theme'
 import { compareBreakpoints } from './utils/compare-breakpoints'
 import { DefaultMap } from './utils/default-map'
 import { isPositiveInteger } from './utils/infer-data-type'
 import { segment } from './utils/segment'
+import * as ValueParser from './value-parser'
+import { walk, WalkAction } from './walk'
 
-export const IS_VALID_VARIANT_NAME = /^@?[a-zA-Z0-9_-]*$/
+export const IS_VALID_VARIANT_NAME = /^@?[a-z0-9][a-zA-Z0-9_-]*(?<![_-])$/
 
 type VariantFn<T extends Variant['kind']> = (
   rule: Rule,
@@ -80,12 +84,15 @@ export class Variants {
     })
   }
 
-  fromAst(name: string, ast: AstNode[]) {
+  fromAst(name: string, ast: AstNode[], designSystem: DesignSystem) {
     let selectors: string[] = []
 
+    let usesAtVariant = false
     walk(ast, (node) => {
       if (node.kind === 'rule') {
         selectors.push(node.selector)
+      } else if (node.kind === 'at-rule' && node.name === '@variant') {
+        usesAtVariant = true
       } else if (node.kind === 'at-rule' && node.name !== '@slot') {
         selectors.push(`${node.name} ${node.params}`)
       }
@@ -94,13 +101,12 @@ export class Variants {
     this.static(
       name,
       (r) => {
-        let body = structuredClone(ast)
+        let body = ast.map(cloneAstNode)
+        if (usesAtVariant) substituteAtVariant(body, designSystem)
         substituteAtSlot(body, r.nodes)
         r.nodes = body
       },
-      {
-        compounds: compoundsForSelectors(selectors),
-      },
+      { compounds: compoundsForSelectors(selectors) },
     )
   }
 
@@ -370,35 +376,83 @@ export function createVariants(theme: Theme): Variants {
 
   function negateConditions(ruleName: string, conditions: string[]) {
     return conditions.map((condition) => {
-      condition = condition.trim()
+      switch (ruleName) {
+        case '@container': {
+          let ast = ValueParser.parse(condition.trim())
 
-      let parts = segment(condition, ' ')
+          // @container {query}
+          //            ^^^^^^^
+          // ast        0
+          if (ast.length >= 1 && ast[0].kind === 'function') {
+            return `not ${condition}`
+          }
 
-      // @media not {query}
-      // @supports not {query}
-      // @container not {query}
-      if (parts[0] === 'not') {
-        return parts.slice(1).join(' ')
-      }
+          // @container not   {query}
+          //            ^^^ ^ ^^^^^^^
+          // ast        0   1 2
+          else if (
+            ast.length >= 3 &&
+            ast[0].kind === 'word' &&
+            ast[0].value === 'not' &&
+            ast[2].kind === 'function'
+          ) {
+            // Drop the leading `not` (ast[0]) and separator (ast[1])
+            ast.splice(0, 2)
 
-      if (ruleName === '@container') {
-        // @container {query}
-        if (parts[0][0] === '(') {
+            return ValueParser.toCss(ast)
+          }
+
+          // @container {name}   not   {query}
+          //            ^^^^^^ ^ ^^^ ^ ^^^^^^^
+          // ast        0      1 2   3 4
+          else if (
+            ast.length >= 5 &&
+            ast[0].kind === 'word' &&
+            ast[2].kind === 'word' &&
+            ast[2].value === 'not' &&
+            ast[4].kind === 'function'
+          ) {
+            // Drop the `not` (ast[2]) and separator (ast[3])
+            ast.splice(2, 2)
+
+            return ValueParser.toCss(ast)
+          }
+
+          // @container {name}   {query}
+          //            ^^^^^^ ^ ^^^^^^^
+          // ast        0      1 2
+          else if (
+            ast.length >= 3 &&
+            ast[0].kind === 'word' &&
+            ast[0].value !== 'not' &&
+            ast[2].kind === 'function'
+          ) {
+            // Inject a separator and a `not`, after the `name` (ast[0])
+            ast.splice(1, 0, { kind: 'separator', value: ' ' }, { kind: 'word', value: 'not' })
+
+            return ValueParser.toCss(ast)
+          }
+
+          // Fallback
+          else {
+            return `not ${condition}`
+          }
+        }
+
+        default: {
+          condition = condition.trim()
+
+          let parts = segment(condition, ' ')
+
+          // @media not {query}
+          // @supports not {query}
+          if (parts[0] === 'not') {
+            return parts.slice(1).join(' ')
+          }
+
           return `not ${condition}`
         }
-
-        // @container {name} not {query}
-        else if (parts[1] === 'not') {
-          return `${parts[0]} ${parts.slice(2).join(' ')}`
-        }
-
-        // @container {name} {query}
-        else {
-          return `${parts[0]} not ${parts.slice(1).join(' ')}`
-        }
       }
-
-      return `not ${condition}`
     })
   }
 
@@ -443,7 +497,7 @@ export function createVariants(theme: Theme): Variants {
 
     let didApply = false
 
-    walk([ruleNode], (node, { path }) => {
+    walk([ruleNode], (node, ctx) => {
       if (node.kind !== 'rule' && node.kind !== 'at-rule') return WalkAction.Continue
       if (node.nodes.length > 0) return WalkAction.Continue
 
@@ -451,11 +505,14 @@ export function createVariants(theme: Theme): Variants {
       let atRules: AtRule[] = []
       let styleRules: StyleRule[] = []
 
-      for (let parent of path) {
-        if (parent.kind === 'at-rule') {
-          atRules.push(parent)
-        } else if (parent.kind === 'rule') {
-          styleRules.push(parent)
+      let path = ctx.path()
+      path.push(node)
+
+      for (let node of path) {
+        if (node.kind === 'at-rule') {
+          atRules.push(node)
+        } else if (node.kind === 'rule') {
+          styleRules.push(node)
         }
       }
 
@@ -519,11 +576,11 @@ export function createVariants(theme: Theme): Variants {
 
     let didApply = false
 
-    walk([ruleNode], (node, { path }) => {
+    walk([ruleNode], (node, ctx) => {
       if (node.kind !== 'rule') return WalkAction.Continue
 
       // Throw out any candidates with variants using nested style rules
-      for (let parent of path.slice(0, -1)) {
+      for (let parent of ctx.path()) {
         if (parent.kind !== 'rule') continue
 
         didApply = false
@@ -571,11 +628,11 @@ export function createVariants(theme: Theme): Variants {
 
     let didApply = false
 
-    walk([ruleNode], (node, { path }) => {
+    walk([ruleNode], (node, ctx) => {
       if (node.kind !== 'rule') return WalkAction.Continue
 
       // Throw out any candidates with variants using nested style rules
-      for (let parent of path.slice(0, -1)) {
+      for (let parent of ctx.path()) {
         if (parent.kind !== 'rule') continue
 
         didApply = false
@@ -719,11 +776,11 @@ export function createVariants(theme: Theme): Variants {
 
     let didApply = false
 
-    walk([ruleNode], (node, { path }) => {
+    walk([ruleNode], (node, ctx) => {
       if (node.kind !== 'rule') return WalkAction.Continue
 
       // Throw out any candidates with variants using nested style rules
-      for (let parent of path.slice(0, -1)) {
+      for (let parent of ctx.path()) {
         if (parent.kind !== 'rule') continue
 
         didApply = false
@@ -754,11 +811,11 @@ export function createVariants(theme: Theme): Variants {
 
     let didApply = false
 
-    walk([ruleNode], (node, { path }) => {
+    walk([ruleNode], (node, ctx) => {
       if (node.kind !== 'rule') return WalkAction.Continue
 
       // Throw out any candidates with variants using nested style rules
-      for (let parent of path.slice(0, -1)) {
+      for (let parent of ctx.path()) {
         if (parent.kind !== 'rule') continue
 
         didApply = false
@@ -1185,10 +1242,10 @@ function quoteAttributeValue(input: string) {
 }
 
 export function substituteAtSlot(ast: AstNode[], nodes: AstNode[]) {
-  walk(ast, (node, { replaceWith }) => {
+  walk(ast, (node) => {
     // Replace `@slot` with rule nodes
     if (node.kind === 'at-rule' && node.name === '@slot') {
-      replaceWith(nodes)
+      return WalkAction.ReplaceSkip(nodes)
     }
 
     // Wrap `@keyframes` and `@property` in `AtRoot` nodes
@@ -1197,4 +1254,53 @@ export function substituteAtSlot(ast: AstNode[], nodes: AstNode[]) {
       return WalkAction.Skip
     }
   })
+}
+
+export function substituteAtVariant(ast: AstNode[], designSystem: DesignSystem): Features {
+  let features = Features.None
+  walk(ast, (variantNode) => {
+    if (variantNode.kind !== 'at-rule' || variantNode.name !== '@variant') return
+
+    let nodes: AstNode[] = []
+    let compoundVariants = segment(variantNode.params, ',')
+    for (let [idx, compoundVariant] of compoundVariants.entries()) {
+      // Starting with the `&` rule node
+      //
+      // Only clone the nodes when we have multiple compound variants to deal
+      // with. The last one can use the original nodes. We do need unique AST
+      // nodes for sourcemap `dst` location information.
+      let node = styleRule(
+        '&',
+        idx === compoundVariants.length - 1
+          ? variantNode.nodes
+          : variantNode.nodes.map(cloneAstNode),
+      )
+
+      let stackedVariants = segment(compoundVariant, ':')
+      for (let i = stackedVariants.length - 1; i >= 0; --i) {
+        let variant = stackedVariants[i].trim()
+
+        if (!variant) {
+          throw new Error(`Cannot use \`@variant\` with empty variant`)
+        }
+
+        let variantAst = designSystem.parseVariant(variant)
+        if (variantAst === null) {
+          throw new Error(`Cannot use \`@variant\` with unknown variant: ${variant}`)
+        }
+
+        let result = applyVariant(node, variantAst, designSystem.variants)
+        if (result === null) {
+          throw new Error(`Cannot use \`@variant\` with variant: ${variant}`)
+        }
+      }
+
+      nodes.push(node)
+    }
+
+    // Update the variant at-rule node, to be the `&` rule node
+    features |= Features.Variants
+    return WalkAction.Replace(nodes)
+  })
+  return features
 }

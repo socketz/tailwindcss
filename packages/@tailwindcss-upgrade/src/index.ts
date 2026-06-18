@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { Scanner } from '@tailwindcss/oxide'
-import { globby } from 'globby'
+import { globby, isGitIgnored } from 'globby'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import pc from 'picocolors'
 import postcss from 'postcss'
 import { migrateJsConfig } from './codemods/config/migrate-js-config'
 import { migratePostCSSConfig } from './codemods/config/migrate-postcss'
@@ -22,6 +23,7 @@ import { isRepoDirty } from './utils/git'
 import { pkg } from './utils/packages'
 import { eprintln, error, header, highlight, info, relative, success } from './utils/renderer'
 import * as version from './utils/version'
+import { writeFileSafely } from './utils/write-file-safely'
 
 const options = {
   '--config': { type: 'string', description: 'Path to the configuration file', alias: '-c' },
@@ -41,6 +43,7 @@ if (flags['--help']) {
 
 async function run() {
   let base = process.cwd()
+  let isIgnored = await isGitIgnored({ cwd: base })
 
   eprintln(header())
   eprintln()
@@ -58,6 +61,31 @@ async function run() {
     }
   }
 
+  info(`Upgrading from Tailwind CSS ${highlight(`v${version.installedTailwindVersion(base)}`)}`, {
+    prefix: '↳ ',
+  })
+
+  if (version.installedTailwindVersion(base) !== version.expectedTailwindVersion(base)) {
+    let pkgManager = await pkg(base).manager()
+
+    error(
+      [
+        'Version mismatch',
+        '',
+        pc.dim('```diff'),
+        `${pc.red('-')} ${`${pc.dim('"tailwindcss":')} ${`${pc.dim('"')}${pc.blue(version.expectedTailwindVersion(base))}${pc.dim('"')}`}`} (expected version in ${highlight('package.json')})`,
+        `${pc.green('+')} ${`${pc.dim('"tailwindcss":')} ${`${pc.dim('"')}${pc.blue(version.installedTailwindVersion(base))}${pc.dim('"')}`}`} (installed version in ${highlight('node_modules')})`,
+        pc.dim('```'),
+        '',
+        `Make sure to run ${highlight(`${pkgManager} install`)} and try again.`,
+      ].join('\n'),
+      {
+        prefix: '↳ ',
+      },
+    )
+    process.exit(1)
+  }
+
   {
     // Stylesheet migrations
 
@@ -69,6 +97,7 @@ async function run() {
       info('Searching for CSS files in the current directory and its subdirectories…')
 
       files = await globby(['**/*.css'], {
+        cwd: base,
         absolute: true,
         gitignore: true,
         // gitignore: true will first search for all .gitignore including node_modules folders, this makes the initial search much faster
@@ -170,6 +199,13 @@ async function run() {
             }
           }
 
+          // Prime the compiler/designSystem cache against the pre-migration AST
+          // so the later template-migration phase sees the same v4 state. After
+          // this point, `sheet.root` may be mutated by `migrateStylesheet`.
+          if (!version.isMajor(3) && sheet.isTailwindRoot) {
+            await Promise.all([sheet.compiler(), sheet.designSystem()])
+          }
+
           await migrateStylesheet(sheet, {
             newPrefix: config?.newPrefix ?? null,
             designSystem: config?.designSystem ?? (await sheet.designSystem()),
@@ -224,7 +260,7 @@ async function run() {
     for (let sheet of stylesheets) {
       if (!sheet.file) continue
 
-      await fs.writeFile(sheet.file, sheet.root.toString())
+      await writeFileSafely(sheet.file, sheet.root.toString())
 
       if (sheet.isTailwindRoot) {
         success(`Migrated stylesheet: ${highlight(relative(sheet.file, base))}`, { prefix: '↳ ' })
@@ -267,6 +303,8 @@ async function run() {
         let designSystem = await sheet.designSystem()
         if (!designSystem) continue
 
+        let config = configBySheet.get(sheet)
+
         // Figure out the source files to migrate
         let sources = (() => {
           // Disable auto source detection
@@ -274,43 +312,123 @@ async function run() {
             return []
           }
 
-          // No root specified, use the base directory
+          // No root specified
           if (compiler.root === null) {
+            // When coming from Tailwind CSS v3, we have to use the
+            // `config.sources` (which came from `config.content` originally)
+            if (version.isMajor(3)) {
+              if (config?.sources) {
+                return config.sources.map((source) => ({ ...source, negated: false }))
+              }
+
+              // When we don't have any sources, then we have to fallback to no
+              // sources at all. We cannot fallback to the `**/*` pattern.
+              return []
+            }
+
+            // When we are upgrading a Tailwind CSS v4 and up version, we use
+            // the default `**/*` pattern. All custom `@source` directives will
+            // be attached later as sources.
             return [{ base, pattern: '**/*', negated: false }]
           }
 
           // Use the specified root
           return [{ ...compiler.root, negated: false }]
         })().concat(compiler.sources)
-
-        let config = configBySheet.get(sheet)
         let scanner = new Scanner({ sources })
         let filesToMigrate = []
+
+        let ignoredPaths = new Set<string>()
+
         for (let file of scanner.files) {
+          file = await fs.realpath(file).catch(() => file) // Ensure we are dealing with the real path, not symlinks
           if (file.endsWith('.css')) continue
+
+          // When a file is git ignored, then we don't want to migrate it even
+          // if it was listed in the `config.content` array or part of any
+          // `@source` directives.
+          //
+          // We can make this an option later to explicitly allow this, but
+          // this should be the default. This guarantees that:
+          //
+          // 1. Files coming from node_modules aren't touched
+          // 2. Generated files aren't changed (the source should update, not the target)
+          // 3. You can see all the changes that happened
+          try {
+            if (isIgnored(file)) {
+              let culprit = file
+
+              // To prevent print all ignored files, we can also walk up the
+              // parent tree and log those instead _if_ they are:
+              //
+              // 1. Also git ignored
+              // 2. Are not going outside of the current repo
+              let parent = path.dirname(file)
+              do {
+                try {
+                  if (isIgnored(parent)) {
+                    culprit = parent
+                  }
+                } catch {
+                  // Escaping the current repo
+                  break
+                }
+
+                let nextParent = path.dirname(parent)
+                if (nextParent === parent) break
+                parent = nextParent
+              } while (parent)
+
+              if (ignoredPaths.has(culprit)) continue // Already logged, skip
+              ignoredPaths.add(culprit)
+
+              if (culprit === file) {
+                info(`Git ignored, skipping: ${highlight(relative(culprit, base))}`, {
+                  prefix: '↳ ',
+                })
+              } else {
+                info(`Git ignored folder, skipping: ${highlight(relative(culprit, base))}`, {
+                  prefix: '↳ ',
+                })
+              }
+
+              continue
+            }
+          } catch (err) {
+            info(`Outside repository, skipping: ${highlight(relative(file, base))}`, {
+              prefix: '↳ ',
+            })
+            // Skip this file when we run into errors. E.g.: when the current
+            // file is not part of the current git repo it will throw an error.
+            continue
+          }
+
           if (seenFiles.has(file)) continue
           seenFiles.add(file)
           filesToMigrate.push(file)
         }
 
         // Migrate each file
+        let changes = 0
         await Promise.allSettled(
-          filesToMigrate.map((file) =>
-            migrateTemplate(designSystem, config?.userConfig ?? null, file),
-          ),
+          filesToMigrate.map(async (file) => {
+            let changed = await migrateTemplate(designSystem, config?.userConfig ?? null, file)
+            if (changed) {
+              changes++
+              info(`Migrated ${highlight(relative(file, base))}`, { prefix: '↳ ' })
+            }
+          }),
         )
 
         if (config?.configFilePath) {
           success(
-            `Migrated templates for configuration file: ${highlight(relative(config.configFilePath, base))}`,
+            `Migrated templates for configuration file: ${highlight(relative(config.configFilePath, base))} (${changes} file${changes === 1 ? '' : 's'} changed)`,
             { prefix: '↳ ' },
           )
         } else {
           success(
-            `Migrated templates for: ${highlight(relative(sheet.file ?? '<unknown>', base))}`,
-            {
-              prefix: '↳ ',
-            },
+            `Migrated templates for: ${highlight(relative(sheet.file ?? '<unknown>', base))} (${changes} file${changes === 1 ? '' : 's'} changed)`,
+            { prefix: '↳ ' },
           )
         }
       }

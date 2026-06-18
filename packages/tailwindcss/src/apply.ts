@@ -1,10 +1,11 @@
 import { Features } from '.'
-import { rule, toCss, walk, WalkAction, type AstNode } from './ast'
+import { cloneAstNode, rule, toCss, type AstNode } from './ast'
 import { compileCandidates } from './compile'
 import type { DesignSystem } from './design-system'
 import type { SourceLocation } from './source-maps/source'
 import { DefaultMap } from './utils/default-map'
 import { segment } from './utils/segment'
+import { walk, WalkAction } from './walk'
 
 export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
   let features = Features.None
@@ -25,7 +26,7 @@ export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
   let definitions = new DefaultMap(() => new Set<AstNode>())
 
   // Collect all new `@utility` definitions and all `@apply` rules first
-  walk([root], (node, { parent, path }) => {
+  walk([root], (node, ctx) => {
     if (node.kind !== 'at-rule') return
 
     // Do not allow `@apply` rules inside `@keyframes` rules.
@@ -61,16 +62,15 @@ export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
     if (node.name === '@apply') {
       // `@apply` cannot be top-level, so we need to have a parent such that we
       // can replace the `@apply` node with the actual utility classes later.
-      if (parent === null) return
+      if (ctx.parent === null) return
 
       features |= Features.AtApply
 
-      parents.add(parent)
+      parents.add(ctx.parent)
 
       for (let dependency of resolveApplyDependencies(node, designSystem)) {
         // Mark every parent in the path as having a dependency to that utility.
-        for (let parent of path) {
-          if (parent === node) continue
+        for (let parent of ctx.path()) {
           if (!parents.has(parent)) continue
           dependencies.get(parent).add(dependency)
         }
@@ -158,16 +158,55 @@ export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
   for (let parent of sorted) {
     if (!('nodes' in parent)) continue
 
-    walk(parent.nodes, (child, { replaceWith }) => {
+    walk(parent.nodes, (child) => {
       if (child.kind !== 'at-rule' || child.name !== '@apply') return
 
       let parts = child.params.split(/(\s+)/g)
       let candidateOffsets: Record<string, number> = {}
+      let normalIdents: string[] = []
+      let dashedIdents: string[] = []
 
       let offset = 0
       for (let [idx, part] of parts.entries()) {
-        if (idx % 2 === 0) candidateOffsets[part] = offset
+        if (idx % 2 === 0) {
+          if (part[0] === '-' && part[1] === '-') {
+            dashedIdents.push(part)
+          } else {
+            normalIdents.push(part)
+          }
+
+          candidateOffsets[part] = offset
+        }
+
         offset += part.length
+      }
+
+      if (dashedIdents.length) {
+        // If we have an `@apply` that only consists of dashed idents then the
+        // user is intending to use a CSS mixin:
+        // https://drafts.csswg.org/css-mixins-1/#apply-rule
+        //
+        // These are not considered utilities and need to be emitted literally.
+        if (normalIdents.length === 0) return WalkAction.Skip
+
+        // If we find a dashed ident *here* it means that someone is trying
+        // to use mixins and our `@apply` behavior together.
+        //
+        // This is invalid and the rules must be written separately. Let the
+        // user know they need to move them into a separate rule.
+        let list = dashedIdents.join(' ')
+
+        throw new Error(
+          `You cannot use \`@apply\` with both mixins and utilities. Please move \`@apply ${list}\` into a separate rule.`,
+        )
+      }
+
+      let hasBody = child.nodes.length > 0
+
+      if (hasBody && normalIdents.length) {
+        let list = normalIdents.join(' ')
+
+        throw new Error(`The rule \`@apply ${list}\` must not have a body.`)
       }
 
       // Replace the `@apply` rule with the actual utility classes
@@ -249,7 +288,7 @@ export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
           let candidate = compiled.nodeSorting.get(node)?.candidate
           let candidateOffset = candidate ? candidateOffsets[candidate] : undefined
 
-          node = structuredClone(node)
+          node = cloneAstNode(node)
 
           if (!src || !candidate || candidateOffset === undefined) {
             // While the original nodes may have come from an `@utility` we still
@@ -291,7 +330,7 @@ export function substituteAtApply(ast: AstNode[], designSystem: DesignSystem) {
           }
         }
 
-        replaceWith(newNodes)
+        return WalkAction.Replace(newNodes)
       }
     })
   }

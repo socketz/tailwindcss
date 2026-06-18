@@ -1,9 +1,11 @@
 import { Features } from '.'
-import { walk, type AstNode } from './ast'
+import { type AstNode } from './ast'
 import type { DesignSystem } from './design-system'
 import { withAlpha } from './utilities'
+import { dimensions } from './utils/dimensions'
 import { segment } from './utils/segment'
 import * as ValueParser from './value-parser'
+import { walk, WalkAction } from './walk'
 
 const CSS_FUNCTIONS: Record<
   string,
@@ -61,6 +63,22 @@ function spacing(
     )
   }
 
+  // Optimization:
+  //
+  // - We know that at this point the `--spacing` value must be set.
+  // - We know that `--spacing` must be set to a `<length>` unit, such as `0.25rem`
+  // - We can assume that the `--spacing` value is not set to a `0`-like value.
+  //   Otherwise `p-<anything>` would calculate as `0` which wouldn't make sense.
+  //
+  // - That means that a value of `0` can be replaced by `0`
+  // - That means that a value of `1` can be replaced by `multiplier`
+  let valueDimension = dimensions.get(value)
+  if (valueDimension) {
+    if (valueDimension[0] === 0) return '0'
+    if (valueDimension[0] === 1) return multiplier
+  }
+
+  // No known optimizations available, use full calculation
   return `calc(${multiplier} * ${value})`
 }
 
@@ -104,7 +122,7 @@ function theme(
   let joinedFallback = fallback.join(', ')
   if (joinedFallback === 'initial') return resolvedValue
 
-  // When the resolved value returns `initial`, resolve with the the fallback value
+  // When the resolved value returns `initial`, resolve with the fallback value
   if (resolvedValue === 'initial') return joinedFallback
 
   // Inject the fallback of a `--theme(…)` function into the fallback of a referenced `--theme(…)`
@@ -187,7 +205,7 @@ export function substituteFunctionsInValue(
   designSystem: DesignSystem,
 ): string {
   let ast = ValueParser.parse(value)
-  ValueParser.walk(ast, (node, { replaceWith }) => {
+  walk(ast, (node) => {
     if (node.kind === 'function' && node.value in CSS_FUNCTIONS) {
       let args = segment(ValueParser.toCss(node.nodes).trim(), ',').map((x) => x.trim())
       let result = CSS_FUNCTIONS[node.value as keyof typeof CSS_FUNCTIONS](
@@ -195,7 +213,7 @@ export function substituteFunctionsInValue(
         source,
         ...args,
       )
-      return replaceWith(ValueParser.parse(result))
+      return WalkAction.Replace(ValueParser.parse(result))
     }
   })
 
@@ -223,7 +241,7 @@ function eventuallyUnquote(value: string) {
 }
 
 function injectFallbackForInitialFallback(ast: ValueParser.ValueAstNode[], fallback: string): void {
-  ValueParser.walk(ast, (node) => {
+  walk(ast, (node) => {
     if (node.kind !== 'function') return
     if (node.value !== 'var' && node.value !== 'theme' && node.value !== '--theme') return
 

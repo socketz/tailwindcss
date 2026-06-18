@@ -8,13 +8,18 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_VERSION: 24
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20]
-
         runner:
           - name: Windows
             os: windows-latest
@@ -50,21 +55,25 @@ jobs:
     name: ${{ matrix.runner.name }} /  ${{ matrix.integration }}
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: 'pnpm'
+          persist-credentials: false
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
+
+      - run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
       # Cargo already skips downloading dependencies if they already exist
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -73,7 +82,7 @@ jobs:
 
       # Cache the `oxide` Rust build
       - name: Cache oxide build
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: |
             ./crates/node/*.node
@@ -99,24 +108,18 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: 'off'
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: 'lld-link'
 
-      - name: Test ${{ matrix.integration }} 1/3
-        run: pnpm run test:integrations ./integrations/${{ matrix.integration }} --shard 1/3
+      - name: Test ${{ matrix.integration }}
+        run: pnpm run test:integrations ./integrations/${{ matrix.integration }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Test ${{ matrix.integration }} 2/3
-        run: pnpm run test:integrations ./integrations/${{ matrix.integration }} --shard 2/3
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Test ${{ matrix.integration }} 3/3
-        run: pnpm run test:integrations ./integrations/${{ matrix.integration }} --shard 3/3
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
+  notify:
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.tests.result == 'failure' }}
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
       - name: Notify Discord
-        if: failure() && github.ref == 'refs/heads/main'
-        uses: discord-actions/message@v2
+        uses: discord-actions/message@5c7149c81a83146e5d01f142be1bf87a61831c4d # v2
         with:
           webhookUrl: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          message: 'The [most recent build](<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>) on the `main` branch has failed.'
+          message: 'The [most recent ${{ github.workflow }} workflow](<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>) on the `main` branch has failed.'

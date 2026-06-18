@@ -1,4 +1,5 @@
-import { expect, it } from 'vitest'
+import { describe, expect, it, test } from 'vitest'
+import { __unstable__loadDesignSystem } from '.'
 import { buildDesignSystem } from './design-system'
 import { Theme } from './theme'
 import { Utilities } from './utilities'
@@ -1775,6 +1776,14 @@ it('should not parse compound group with a non-compoundable variant', () => {
   expect(run('group-*:flex', { utilities, variants })).toMatchInlineSnapshot(`[]`)
 })
 
+it('empty data types are invalid', () => {
+  let utilities = new Utilities()
+  utilities.functional('bg', () => [])
+  let variants = new Variants()
+
+  expect(run('bg-[:foo]', { utilities, variants })).toMatchInlineSnapshot(`[]`)
+})
+
 it('should parse a variant containing an arbitrary string with unbalanced parens, brackets, curlies and other quotes', () => {
   let utilities = new Utilities()
   utilities.static('flex', () => [])
@@ -1988,7 +1997,12 @@ it.each([
 
   // Arbitrary variant values that end the block
   'data-[a]{color:red}foo[a]:flex',
-])('should not parse invalid arbitrary values: %s', (rawCandidate) => {
+
+  // Named values contain invalid characters
+  'data-foo=bar:flex',
+  'bg-foo=bar',
+  'bg-red-500/foo=bar',
+])('should not parse invalid values: %s', (rawCandidate) => {
   let utilities = new Utilities()
   utilities.static('flex', () => [])
   utilities.functional('bg', () => [])
@@ -1998,4 +2012,130 @@ it.each([
   variants.compound('group', Compounds.StyleRules, () => {})
 
   expect(run(rawCandidate, { utilities, variants })).toEqual([])
+})
+
+const candidates = [
+  // Arbitrary candidates
+  ['[color:red]', '[color:red]'],
+  ['[color:red]/50', '[color:red]/50'],
+  ['[color:red]/[0.5]', '[color:red]/[0.5]'],
+  ['[color:red]/50!', '[color:red]/50!'],
+  ['![color:red]/50', '[color:red]/50!'],
+  ['[color:red]/[0.5]!', '[color:red]/[0.5]!'],
+
+  // Static candidates
+  ['box-border', 'box-border'],
+  ['underline!', 'underline!'],
+  ['!underline', 'underline!'],
+  ['-inset-full', '-inset-full'],
+
+  // Functional candidates
+  ['bg-red-500', 'bg-red-500'],
+  ['bg-red-500/50', 'bg-red-500/50'],
+  ['bg-red-500/[0.5]', 'bg-red-500/[0.5]'],
+  ['bg-red-500!', 'bg-red-500!'],
+  ['!bg-red-500', 'bg-red-500!'],
+  ['bg-[#0088cc]/50', 'bg-[#0088cc]/50'],
+  ['bg-[#0088cc]/[0.5]', 'bg-[#0088cc]/[0.5]'],
+  ['bg-[#0088cc]!', 'bg-[#0088cc]!'],
+  ['!bg-[#0088cc]', 'bg-[#0088cc]!'],
+  ['bg-[var(--spacing)-1px]', 'bg-[var(--spacing)-1px]'],
+  ['bg-[var(--spacing)_-_1px]', 'bg-[var(--spacing)-1px]'],
+  ['bg-[var(--_spacing)]', 'bg-(--_spacing)'],
+  ['bg-(--_spacing)', 'bg-(--_spacing)'],
+  ['bg-[-1px_-1px]', 'bg-[-1px_-1px]'],
+  ['p-[round(to-zero,1px)]', 'p-[round(to-zero,1px)]'],
+  ['w-1/2', 'w-1/2'],
+  ['p-[calc((100vw-theme(maxWidth.2xl))_/_2)]', 'p-[calc((100vw-theme(maxWidth.2xl))/2)]'],
+
+  // Keep spaces in strings
+  ['content-["hello_world"]', 'content-["hello_world"]'],
+  ['content-[____"hello_world"___]', 'content-["hello_world"]'],
+
+  // Do not escape underscores for url() and CSS variable in var()
+  ['bg-[no-repeat_url(/image_13.png)]', 'bg-[no-repeat_url(/image_13.png)]'],
+  [
+    'bg-[var(--spacing-0_5,_var(--spacing-1_5,_3rem))]',
+    'bg-(--spacing-0_5,var(--spacing-1_5,3rem))',
+  ],
+
+  // Normalize whitespace in arbitrary properties
+  ['[display:flex]', '[display:flex]'],
+  ['[display:_flex]', '[display:flex]'],
+  ['[display:flex_]', '[display:flex]'],
+  ['[display:_flex_]', '[display:flex]'],
+
+  // Normalize whitespace in `calc` expressions
+  ['w-[calc(100%-2rem)]', 'w-[calc(100%-2rem)]'],
+  ['w-[calc(100%_-_2rem)]', 'w-[calc(100%-2rem)]'],
+
+  // Normalize the important modifier
+  ['!flex', 'flex!'],
+  ['flex!', 'flex!'],
+]
+
+const variants = [
+  ['', ''], // no variant
+  ['*:', '*:'],
+  ['focus:', 'focus:'],
+  ['group-focus:', 'group-focus:'],
+
+  ['hover:focus:', 'hover:focus:'],
+  ['hover:group-focus:', 'hover:group-focus:'],
+  ['group-hover:focus:', 'group-hover:focus:'],
+  ['group-hover:group-focus:', 'group-hover:group-focus:'],
+
+  ['min-[10px]:', 'min-[10px]:'],
+
+  // Normalize spaces
+  ['min-[calc(1000px_+_12em)]:', 'min-[calc(1000px+12em)]:'],
+  ['min-[calc(1000px_+12em)]:', 'min-[calc(1000px+12em)]:'],
+  ['min-[calc(1000px+_12em)]:', 'min-[calc(1000px+12em)]:'],
+  ['min-[calc(1000px___+___12em)]:', 'min-[calc(1000px+12em)]:'],
+
+  ['peer-[&_p]:', 'peer-[&_p]:'],
+  ['peer-[&_p]:hover:', 'peer-[&_p]:hover:'],
+  ['hover:peer-[&_p]:', 'hover:peer-[&_p]:'],
+  ['hover:peer-[&_p]:focus:', 'hover:peer-[&_p]:focus:'],
+  ['peer-[&:hover]:peer-[&_p]:', 'peer-[&:hover]:peer-[&_p]:'],
+
+  ['[p]:', '[p]:'],
+  ['[_p_]:', '[p]:'],
+  ['has-[p]:', 'has-[p]:'],
+  ['has-[_p_]:', 'has-[p]:'],
+
+  // Simplify `&:is(p)` to `p`
+  ['[&:is(p)]:', '[p]:'],
+  ['[&:is(_p_)]:', '[p]:'],
+  ['has-[&:is(p)]:', 'has-[p]:'],
+  ['has-[&:is(_p_)]:', 'has-[p]:'],
+
+  // Handle special `@` variants. These shouldn't be printed as `@-`
+  ['@xl:', '@xl:'],
+  ['@[123px]:', '@[123px]:'],
+
+  // Compound variants that forward modifiers
+  ['not-group-hover/name:', 'not-group-hover/name:'],
+  ['has-group-peer-hover/name:', 'has-group-peer-hover/name:'],
+  ['in-group-peer-hover/name:', 'in-group-peer-hover/name:'],
+]
+
+let combinations: [string, string][] = []
+
+for (let [inputVariant, outputVariant] of variants) {
+  for (let [inputCandidate, outputCandidate] of candidates) {
+    combinations.push([`${inputVariant}${inputCandidate}`, `${outputVariant}${outputCandidate}`])
+  }
+}
+
+describe('normalize candidates', () => {
+  test.each(combinations)('`%s` -> `%s`', async (candidate: string, result: string) => {
+    let designSystem = await __unstable__loadDesignSystem('@tailwind utilities', {
+      base: __dirname,
+    })
+
+    let [parsed] = designSystem.parseCandidate(candidate)
+
+    expect(designSystem.printCandidate(parsed)).toEqual(result)
+  })
 })

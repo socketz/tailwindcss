@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { candidate, css, html, js, json, retryAssertion, test, ts, yaml } from '../utils'
+import { candidate, css, html, js, json, test, ts, yaml } from '../utils'
 
 test(
   'production build (string)',
@@ -662,23 +662,54 @@ test(
       `,
       'src/index.css': css` @import './tailwind.css'; `,
       'src/tailwind.css': css`
-        @reference 'tailwindcss/does-not-exist';
+        @reference 'tailwindcss/theme';
         @import 'tailwindcss/utilities';
       `,
     },
   },
   async ({ fs, expect, spawn }) => {
+    // 1. Start the watcher
+    //
+    // It must have valid CSS for the initial build
     let process = await spawn('pnpm postcss src/index.css --output dist/out.css --watch --verbose')
-
-    await process.onStderr((message) =>
-      message.includes('does-not-exist is not exported from package'),
-    )
-
-    await retryAssertion(async () => expect(await fs.read('dist/out.css')).toEqual(''))
 
     await process.onStderr((message) => message.includes('Waiting for file changes...'))
 
-    // Fix the CSS file
+    expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- dist/out.css ---
+      .underline {
+        text-decoration-line: underline;
+      }
+      "
+    `)
+
+    // 2. Cause an error
+    await fs.write(
+      'src/tailwind.css',
+      css`
+        @reference 'tailwindcss/does-not-exist';
+        @import 'tailwindcss/utilities';
+      `,
+    )
+
+    // 2.5 Write to a content file
+    await fs.write('src/index.html', html`
+      <div class="flex underline"></div>
+    `)
+
+    await process.onStderr((message) => message.includes('"./does-not-exist" is not exported'))
+
+    expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- dist/out.css ---
+      .underline {
+        text-decoration-line: underline;
+      }
+      "
+    `)
+
+    // 3. Fix the CSS file
     await fs.write(
       'src/tailwind.css',
       css`
@@ -686,11 +717,15 @@ test(
         @import 'tailwindcss/utilities';
       `,
     )
-    await process.onStderr((message) => message.includes('Finished'))
+
+    await process.onStderr((message) => message.includes('Waiting for file changes...'))
 
     expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
       "
       --- dist/out.css ---
+      .flex {
+        display: flex;
+      }
       .underline {
         text-decoration-line: underline;
       }
@@ -705,11 +740,20 @@ test(
         @import 'tailwindcss/utilities';
       `,
     )
-    await process.onStderr((message) =>
-      message.includes('does-not-exist is not exported from package'),
-    )
 
-    await retryAssertion(async () => expect(await fs.read('dist/out.css')).toEqual(''))
+    await process.onStderr((message) => message.includes('"./does-not-exist" is not exported'))
+
+    expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- dist/out.css ---
+      .flex {
+        display: flex;
+      }
+      .underline {
+        text-decoration-line: underline;
+      }
+      "
+    `)
   },
 )
 
@@ -775,5 +819,75 @@ test(
       original: ';...',
       generated: '}...',
     })
+  },
+)
+
+test(
+  'source(…) and `@source` are relative to the file they are in',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "postcss": "^8",
+            "postcss-cli": "^10",
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/postcss": "workspace:^"
+          }
+        }
+      `,
+
+      'postcss.config.js': js`
+        module.exports = {
+          plugins: {
+            '@tailwindcss/postcss': {},
+          },
+        }
+      `,
+
+      'index.css': css` @import './project-a/src/index.css'; `,
+
+      'project-a/src/index.css': css`
+        /* Run auto-content detection in ../../project-b */
+        @import 'tailwindcss/utilities' source('../../project-b');
+
+        /* Explicitly using node_modules in the @source allows git ignored folders */
+        @source '../../project-c';
+      `,
+
+      // Project A is the current folder, but we explicitly configured
+      // `source(project-b)`, therefore project-a should not be included in
+      // the output.
+      'project-a/src/index.html': html`
+        <div
+          class="content-['SHOULD-NOT-EXIST-IN-OUTPUT'] content-['project-a/src/index.html']"
+        ></div>
+      `,
+
+      // Project B is the configured `source(…)`, therefore auto source
+      // detection should include known extensions and folders in the output.
+      'project-b/src/index.html': html`
+        <div
+          class="content-['project-b/src/index.html']"
+        ></div>
+      `,
+
+      // Project C should apply auto source detection, therefore known
+      // extensions and folders should be included in the output.
+      'project-c/src/index.html': html`
+        <div
+          class="content-['project-c/src/index.html']"
+        ></div>
+      `,
+    },
+  },
+  async ({ fs, exec, root, expect }) => {
+    await exec('pnpm postcss ./index.css --output dist/out.css', { cwd: root })
+
+    let content = await fs.dumpFiles('./dist/*.css')
+
+    expect(content).not.toContain(candidate`content-['project-a/src/index.html']`)
+    expect(content).toContain(candidate`content-['project-b/src/index.html']`)
+    expect(content).toContain(candidate`content-['project-c/src/index.html']`)
   },
 )

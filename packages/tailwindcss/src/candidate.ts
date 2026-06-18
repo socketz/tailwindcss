@@ -3,12 +3,15 @@ import { decodeArbitraryValue } from './utils/decode-arbitrary-value'
 import { DefaultMap } from './utils/default-map'
 import { isValidArbitrary } from './utils/is-valid-arbitrary'
 import { segment } from './utils/segment'
+import type { ValueFunctionNode } from './value-parser'
 import * as ValueParser from './value-parser'
+import { walk, WalkAction } from './walk'
 
 const COLON = 0x3a
 const DASH = 0x2d
 const LOWER_A = 0x61
 const LOWER_Z = 0x7a
+const IS_VALID_NAMED_VALUE = /^[a-zA-Z0-9_.%-]+$/
 
 export type ArbitraryUtilityValue = {
   kind: 'arbitrary'
@@ -215,6 +218,102 @@ export type Candidate =
       raw: string
     }
 
+export function cloneCandidate<T extends Candidate>(candidate: T): T {
+  switch (candidate.kind) {
+    case 'arbitrary':
+      return {
+        kind: candidate.kind,
+        property: candidate.property,
+        value: candidate.value,
+        modifier: candidate.modifier
+          ? { kind: candidate.modifier.kind, value: candidate.modifier.value }
+          : null,
+        variants: candidate.variants.map(cloneVariant),
+        important: candidate.important,
+        raw: candidate.raw,
+      } satisfies Extract<Candidate, { kind: 'arbitrary' }> as T
+
+    case 'static':
+      return {
+        kind: candidate.kind,
+        root: candidate.root,
+        variants: candidate.variants.map(cloneVariant),
+        important: candidate.important,
+        raw: candidate.raw,
+      } satisfies Extract<Candidate, { kind: 'static' }> as T
+
+    case 'functional':
+      return {
+        kind: candidate.kind,
+        root: candidate.root,
+        value: candidate.value
+          ? candidate.value.kind === 'arbitrary'
+            ? {
+                kind: candidate.value.kind,
+                dataType: candidate.value.dataType,
+                value: candidate.value.value,
+              }
+            : {
+                kind: candidate.value.kind,
+                value: candidate.value.value,
+                fraction: candidate.value.fraction,
+              }
+          : null,
+        modifier: candidate.modifier
+          ? { kind: candidate.modifier.kind, value: candidate.modifier.value }
+          : null,
+        variants: candidate.variants.map(cloneVariant),
+        important: candidate.important,
+        raw: candidate.raw,
+      } satisfies Extract<Candidate, { kind: 'functional' }> as T
+
+    default:
+      candidate satisfies never
+      throw new Error('Unknown candidate kind')
+  }
+}
+
+export function cloneVariant<T extends Variant>(variant: T): T {
+  switch (variant.kind) {
+    case 'arbitrary':
+      return {
+        kind: variant.kind,
+        selector: variant.selector,
+        relative: variant.relative,
+      } satisfies Extract<Variant, { kind: 'arbitrary' }> as T
+
+    case 'static':
+      return { kind: variant.kind, root: variant.root } satisfies Extract<
+        Variant,
+        { kind: 'static' }
+      > as T
+
+    case 'functional':
+      return {
+        kind: variant.kind,
+        root: variant.root,
+        value: variant.value ? { kind: variant.value.kind, value: variant.value.value } : null,
+        modifier: variant.modifier
+          ? { kind: variant.modifier.kind, value: variant.modifier.value }
+          : null,
+      } satisfies Extract<Variant, { kind: 'functional' }> as T
+
+    case 'compound':
+      return {
+        kind: variant.kind,
+        root: variant.root,
+        variant: cloneVariant(variant.variant),
+        modifier: variant.modifier
+          ? { kind: variant.modifier.kind, value: variant.modifier.value }
+          : null,
+      } satisfies Extract<Variant, { kind: 'compound' }> as T
+
+    default:
+      variant satisfies never
+      throw new Error('Unknown variant kind')
+  }
+}
+
 export function* parseCandidate(input: string, designSystem: DesignSystem): Iterable<Candidate> {
   // hover:focus:underline
   // ^^^^^ ^^^^^^           -> Variants
@@ -385,6 +484,7 @@ export function* parseCandidate(input: string, designSystem: DesignSystem): Iter
   //
   // E.g.:
   //
+  // ```
   // bg-(--my-var)
   // ^^            -> Root
   //    ^^^^^^^^^^ -> Arbitrary value
@@ -456,7 +556,7 @@ export function* parseCandidate(input: string, designSystem: DesignSystem): Iter
         if (!isValidArbitrary(arbitraryValue)) continue
 
         // Extract an explicit typehint if present, e.g. `bg-[color:var(--my-var)])`
-        let typehint = ''
+        let typehint: string | null = null
         for (let i = 0; i < arbitraryValue.length; i++) {
           let code = arbitraryValue.charCodeAt(i)
 
@@ -482,6 +582,8 @@ export function* parseCandidate(input: string, designSystem: DesignSystem): Iter
           continue
         }
 
+        if (typehint === '') continue
+
         candidate.value = {
           kind: 'arbitrary',
           dataType: typehint || null,
@@ -495,6 +597,8 @@ export function* parseCandidate(input: string, designSystem: DesignSystem): Iter
           modifierSegment === null || candidate.modifier?.kind === 'arbitrary'
             ? null
             : `${value}/${modifierSegment}`
+
+        if (!IS_VALID_NAMED_VALUE.test(value)) continue
 
         candidate.value = {
           kind: 'named',
@@ -546,6 +650,8 @@ function parseModifier(modifier: string): CandidateModifier | null {
       value: arbitraryValue,
     }
   }
+
+  if (!IS_VALID_NAMED_VALUE.test(modifier)) return null
 
   return {
     kind: 'named',
@@ -698,6 +804,8 @@ export function parseVariant(variant: string, designSystem: DesignSystem): Varia
             }
           }
 
+          if (!IS_VALID_NAMED_VALUE.test(value)) continue
+
           return {
             kind: 'functional',
             root,
@@ -708,6 +816,13 @@ export function parseVariant(variant: string, designSystem: DesignSystem): Varia
 
         case 'compound': {
           if (value === null) return null
+
+          // Forward the modifier of the compound variants to its subVariant.
+          // This allows for `not-group-hover/name:flex` to work.
+          if (modifier && (root === 'not' || root === 'has' || root === 'in')) {
+            value = `${value}/${modifier}`
+            modifier = null
+          }
 
           let subVariant = designSystem.parseVariant(value)
           if (subVariant === null) return null
@@ -771,6 +886,11 @@ function* findRoots(input: string, exists: (input: string) => boolean): Iterable
       // invalid named value, e.g.: `bg-`. This makes the candidate invalid and we
       // can skip any further parsing.
       if (root[1] === '') break
+
+      // Edge case: `@-…` is not valid as a variant or a utility so we want to
+      // skip if an `@` is followed by a `-`. Otherwise `@-2xl:flex` and
+      // `@-2xl:flex` would be considered the same.
+      if (root[0] === '@' && exists('@') && input[idx] === '-') break
 
       yield root
     }
@@ -916,40 +1036,56 @@ const printArbitraryValueCache = new DefaultMap<string, string>((input) => {
 
   let drop = new Set<ValueParser.ValueAstNode>()
 
-  ValueParser.walk(ast, (node, { parent }) => {
-    let parentArray = parent === null ? ast : (parent.nodes ?? [])
+  let symbols = new Set([
+    // Selectors
+    '~', // Subsequent sibling combinator
+    '>', // Child combinator
 
+    // Math operators
+    '+', // or next sibling combinator
+    '-',
+    '*', // or universal selector
+    '/',
+  ])
+  walk(ast, (node, ctx) => {
     // Handle operators (e.g.: inside of `calc(…)`)
-    if (
-      node.kind === 'word' &&
-      // Operators
-      (node.value === '+' || node.value === '-' || node.value === '*' || node.value === '/')
-    ) {
-      let idx = parentArray.indexOf(node) ?? -1
+    if (node.kind === 'word' && symbols.has(node.value)) {
+      let idx = ctx.index
 
       // This should not be possible
       if (idx === -1) return
 
-      let previous = parentArray[idx - 1]
+      // a + b
+      //   ^ node
+      //  ^ previous (whitespace)
+      let previous = ctx.siblings[idx - 1]
       if (previous?.kind !== 'separator' || previous.value !== ' ') return
 
-      let next = parentArray[idx + 1]
+      // a + b
+      //   ^ node
+      //    ^ next (whitespace)
+      let next = ctx.siblings[idx + 1]
       if (next?.kind !== 'separator' || next.value !== ' ') return
+
+      // a + b
+      //   ^ node
+      // ^ previous (node)
+      let previousPrevious = ctx.siblings[idx - 2]
+      if (previousPrevious && symbols.has(previousPrevious.value)) return
+
+      // a + b
+      //   ^ node
+      //     ^ next (node)
+      let nextNext = ctx.siblings[idx + 2]
+      if (nextNext && symbols.has(nextNext.value)) return
 
       drop.add(previous)
       drop.add(next)
     }
 
-    // The value parser handles `/` as a separator in some scenarios. E.g.:
-    // `theme(colors.red/50%)`. Because of this, we have to handle this case
-    // separately.
-    else if (node.kind === 'separator' && node.value.trim() === '/') {
-      node.value = '/'
-    }
-
     // Leading and trailing whitespace
     else if (node.kind === 'separator' && node.value.length > 0 && node.value.trim() === '') {
-      if (parentArray[0] === node || parentArray[parentArray.length - 1] === node) {
+      if (ctx.siblings[0] === node || ctx.siblings[ctx.siblings.length - 1] === node) {
         drop.add(node)
       }
     }
@@ -959,13 +1095,48 @@ const printArbitraryValueCache = new DefaultMap<string, string>((input) => {
     else if (node.kind === 'separator' && node.value.trim() === ',') {
       node.value = ','
     }
+
+    // Wrap custom functions starting with `--`, in parentheses if preceeded by
+    // a symbol. E.g.: `calc(100%---spacing(2))` → `calc(100%-(--spacing(2)))`
+    else if (node.kind === 'function' && node.value.startsWith('--')) {
+      let idx = ctx.index
+
+      // When it's the first argument, then we don't have to wrap it in `(…)`
+      //
+      // E.g.: `--spacing(…)`, no need to wrap
+      //       `calc(100%---spacing(…))`, we want to wrap
+      //
+      if (idx <= 0) return
+
+      // When it's not the first argument, we likely want to wrap it. However,
+      // when it's separated by a `,` then it's readable enough.
+      //
+      // E.g.: `min(100%,--spacing(2))` is readable, in fact
+      //       `min(100%,(--spacing(2)))` would make it worse
+      let previous = ctx.siblings[idx - 1]
+      if (previous?.kind === 'separator' && previous.value === ',') return
+
+      // When it's part of a bigger list, aka no special symbols were used, then
+      // we don't have to wrap it either.
+      //
+      // E.g.: `shadow-[inset_0px_1px_--theme(--color-white/15%)]`, wrapping would look unnecessary:
+      //       `shadow-[inset_0px_1px_(--theme(--color-white/15%))]`
+      let previousPrevious = ctx.siblings[idx - 2]
+      if (previousPrevious && !symbols.has(previousPrevious.value)) return
+
+      return WalkAction.ReplaceSkip({
+        kind: 'function',
+        value: '', // Unnamed, so will result in `(…)`
+        nodes: [node],
+      } satisfies ValueFunctionNode)
+    }
   })
 
   if (drop.size > 0) {
-    ValueParser.walk(ast, (node, { replaceWith }) => {
+    walk(ast, (node) => {
       if (drop.has(node)) {
         drop.delete(node)
-        replaceWith([])
+        return WalkAction.ReplaceSkip([])
       }
     })
   }

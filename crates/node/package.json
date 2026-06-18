@@ -1,6 +1,6 @@
 {
   "name": "@tailwindcss/oxide",
-  "version": "4.1.12",
+  "version": "4.3.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tailwindlabs/tailwindcss.git",
@@ -32,38 +32,38 @@
     }
   },
   "license": "MIT",
+<<<<<<< HEAD
   "dependencies": {
     "tar": "^7.5.11",
     "detect-libc": "^2.0.4"
   },
+=======
+>>>>>>> c46f654fa0039ad4741c6ecefbe4e2a208a665c3
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0-alpha.78",
-    "@napi-rs/wasm-runtime": "^0.2.12",
-    "emnapi": "1.4.5"
+    "@napi-rs/cli": "3.7.0",
+    "@napi-rs/wasm-runtime": "^1.1.5",
+    "emnapi": "1.11.1"
   },
   "engines": {
-    "node": ">= 10"
+    "node": ">= 20"
   },
   "files": [
     "index.js",
-    "index.d.ts",
-    "scripts/install.js"
+    "index.d.ts"
   ],
   "publishConfig": {
     "provenance": true,
     "access": "public"
   },
   "scripts": {
-    "artifacts": "napi artifacts",
     "build": "pnpm run build:platform && pnpm run build:wasm",
-    "build:platform": "napi build --platform --release --no-const-enum",
+    "build:platform": "napi build --platform --release",
     "postbuild:platform": "node ./scripts/move-artifacts.mjs",
-    "build:wasm": "napi build --release --target wasm32-wasip1-threads --no-const-enum",
+    "build:wasm": "napi build --release --target wasm32-wasip1-threads",
     "postbuild:wasm": "node ./scripts/move-artifacts.mjs",
     "dev": "cargo watch --quiet --shell 'npm run build'",
-    "build:debug": "napi build --platform --no-const-enum",
-    "version": "napi version",
-    "postinstall": "node ./scripts/install.js"
+    "build:debug": "napi build --platform",
+    "version": "napi version"
   },
   "optionalDependencies": {
     "@tailwindcss/oxide-android-arm64": "workspace:*",

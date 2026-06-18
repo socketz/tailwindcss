@@ -6,13 +6,12 @@ import {
   comment,
   context,
   context as contextNode,
+  cssContext,
   decl,
   optimizeAst,
   rule,
   styleRule,
   toCss,
-  walk,
-  WalkAction,
   type AstNode,
   type AtRule,
   type Context,
@@ -22,7 +21,7 @@ import { substituteAtImports } from './at-import'
 import { applyCompatibilityHooks } from './compat/apply-compat-hooks'
 import type { UserConfig } from './compat/config/types'
 import { type Plugin } from './compat/plugin-api'
-import { applyVariant, compileCandidates } from './compile'
+import { compileCandidates } from './compile'
 import { substituteFunctions } from './css-functions'
 import * as CSS from './css-parser'
 import { buildDesignSystem, type DesignSystem } from './design-system'
@@ -32,8 +31,11 @@ import { createCssUtility } from './utilities'
 import { expand } from './utils/brace-expansion'
 import { escape, unescape } from './utils/escape'
 import { segment } from './utils/segment'
-import { compoundsForSelectors, IS_VALID_VARIANT_NAME } from './variants'
-export type Config = UserConfig
+import { topologicalSort } from './utils/topological-sort'
+import { compoundsForSelectors, IS_VALID_VARIANT_NAME, substituteAtVariant } from './variants'
+import { walk, WalkAction } from './walk'
+
+export interface Config extends UserConfig {}
 
 const IS_VALID_PREFIX = /^[a-z]+$/
 
@@ -132,6 +134,9 @@ export const enum Features {
 
   // `@variant` was used
   Variants = 1 << 5,
+
+  // `@theme` was used
+  AtTheme = 1 << 6,
 }
 
 async function parseCss(
@@ -150,7 +155,8 @@ async function parseCss(
 
   let important = null as boolean | null
   let theme = new Theme()
-  let customVariants: ((designSystem: DesignSystem) => void)[] = []
+  let customVariants = new Map<string, (designSystem: DesignSystem) => void>()
+  let customVariantDependencies = new Map<string, Set<string>>()
   let customUtilities: ((designSystem: DesignSystem) => void)[] = []
   let firstThemeRule = null as StyleRule | null
   let utilitiesNode = null as AtRule | null
@@ -161,8 +167,9 @@ async function parseCss(
   let root = null as Root
 
   // Handle at-rules
-  walk(ast, (node, { parent, replaceWith, context }) => {
+  walk(ast, (node, _ctx) => {
     if (node.kind !== 'at-rule') return
+    let ctx = cssContext(_ctx)
 
     // Find `@tailwind utilities` so that we can later replace it with the
     // actual generated utility class CSS.
@@ -172,16 +179,14 @@ async function parseCss(
     ) {
       // Any additional `@tailwind utilities` nodes can be removed
       if (utilitiesNode !== null) {
-        replaceWith([])
-        return
+        return WalkAction.Replace([])
       }
 
       // When inside `@reference` we should treat `@tailwind utilities` as if
       // it wasn't there in the first place. This should also let `build()`
       // return the cached static AST.
-      if (context.reference) {
-        replaceWith([])
-        return
+      if (ctx.context.reference) {
+        return WalkAction.Replace([])
       }
 
       let params = segment(node.params, ' ')
@@ -205,7 +210,7 @@ async function parseCss(
           }
 
           root = {
-            base: (context.sourceBase as string) ?? (context.base as string),
+            base: (ctx.context.sourceBase as string) ?? (ctx.context.base as string),
             pattern: path.slice(1, -1),
           }
         }
@@ -217,7 +222,7 @@ async function parseCss(
 
     // Collect custom `@utility` at-rules
     if (node.name === '@utility') {
-      if (parent !== null) {
+      if (ctx.parent !== null) {
         throw new Error('`@utility` cannot be nested.')
       }
 
@@ -255,7 +260,7 @@ async function parseCss(
         throw new Error('`@source` cannot have a body.')
       }
 
-      if (parent !== null) {
+      if (ctx.parent !== null) {
         throw new Error('`@source` cannot be nested.')
       }
 
@@ -270,7 +275,7 @@ async function parseCss(
 
       if (path[0] === 'i' && path.startsWith('inline(')) {
         inline = true
-        path = path.slice(7, -1)
+        path = path.slice(7, -1).trim()
       }
 
       if (
@@ -293,20 +298,20 @@ async function parseCss(
         }
       } else {
         sources.push({
-          base: context.base as string,
+          base: ctx.context.base as string,
           pattern: source,
           negated: not,
         })
       }
-      replaceWith([])
-      return
+
+      return WalkAction.ReplaceSkip([])
     }
 
     // Apply `@variant` at-rules
     if (node.name === '@variant') {
       // Legacy `@variant` at-rules containing `@slot` or without a body should
       // be considered a `@custom-variant` at-rule.
-      if (parent === null) {
+      if (ctx.parent === null) {
         // Body-less `@variant`, e.g.: `@variant foo (…);`
         if (node.nodes.length === 0) {
           node.name = '@custom-variant'
@@ -345,18 +350,15 @@ async function parseCss(
 
     // Register custom variants from `@custom-variant` at-rules
     if (node.name === '@custom-variant') {
-      if (parent !== null) {
+      if (ctx.parent !== null) {
         throw new Error('`@custom-variant` cannot be nested.')
       }
-
-      // Remove `@custom-variant` at-rule so it's not included in the compiled CSS
-      replaceWith([])
 
       let [name, selector] = segment(node.params, ' ')
 
       if (!IS_VALID_VARIANT_NAME.test(name)) {
         throw new Error(
-          `\`@custom-variant ${name}\` defines an invalid variant name. Variants should only contain alphanumeric, dashes or underscore characters.`,
+          `\`@custom-variant ${name}\` defines an invalid variant name. Variants should only contain alphanumeric, dashes, or underscore characters and start with a lowercase letter or number.`,
         )
       }
 
@@ -390,7 +392,7 @@ async function parseCss(
           }
         }
 
-        customVariants.push((designSystem) => {
+        customVariants.set(name, (designSystem) => {
           designSystem.variants.static(
             name,
             (r) => {
@@ -411,8 +413,7 @@ async function parseCss(
             },
           )
         })
-
-        return
+        customVariantDependencies.set(name, new Set<string>())
       }
 
       // Variants without a selector, but with a body:
@@ -431,12 +432,21 @@ async function parseCss(
       // }
       // ```
       else {
-        customVariants.push((designSystem) => {
-          designSystem.variants.fromAst(name, node.nodes)
+        let dependencies = new Set<string>()
+        walk(node.nodes, (child) => {
+          if (child.kind === 'at-rule' && child.name === '@variant') {
+            dependencies.add(child.params)
+          }
         })
 
-        return
+        customVariants.set(name, (designSystem) => {
+          designSystem.variants.fromAst(name, node.nodes, designSystem)
+        })
+        customVariantDependencies.set(name, dependencies)
       }
+
+      // Remove `@custom-variant` at-rule so it's not included in the compiled CSS
+      return WalkAction.ReplaceSkip([])
     }
 
     if (node.name === '@media') {
@@ -448,13 +458,14 @@ async function parseCss(
         if (param.startsWith('source(')) {
           let path = param.slice(7, -1)
 
-          walk(node.nodes, (child, { replaceWith }) => {
+          walk(node.nodes, (child) => {
             if (child.kind !== 'at-rule') return
 
             if (child.name === '@tailwind' && child.params === 'utilities') {
               child.params += ` source(${path})`
-              replaceWith([contextNode({ sourceBase: context.base }, [child])])
-              return WalkAction.Stop
+              return WalkAction.ReplaceStop([
+                contextNode({ sourceBase: ctx.context.base }, [child]),
+              ])
             }
           })
         }
@@ -469,6 +480,7 @@ async function parseCss(
           let hasReference = themeParams.includes('reference')
 
           walk(node.nodes, (child) => {
+            if (child.kind === 'context') return
             if (child.kind !== 'at-rule') {
               if (hasReference) {
                 throw new Error(
@@ -521,15 +533,19 @@ async function parseCss(
       if (unknownParams.length > 0) {
         node.params = unknownParams.join(' ')
       } else if (params.length > 0) {
-        replaceWith(node.nodes)
+        return WalkAction.Replace(node.nodes)
       }
+
+      return WalkAction.Continue
     }
 
     // Handle `@theme`
     if (node.name === '@theme') {
       let [themeOptions, themePrefix] = parseThemeOptions(node.params)
 
-      if (context.reference) {
+      features |= Features.AtTheme
+
+      if (ctx.context.reference) {
         themeOptions |= ThemeOptions.REFERENCE
       }
 
@@ -573,15 +589,14 @@ async function parseCss(
       if (!firstThemeRule) {
         firstThemeRule = styleRule(':root, :host', [])
         firstThemeRule.src = node.src
-        replaceWith([firstThemeRule])
+        return WalkAction.ReplaceSkip(firstThemeRule)
       } else {
-        replaceWith([])
+        return WalkAction.ReplaceSkip([])
       }
-      return WalkAction.Skip
     }
   })
 
-  let designSystem = buildDesignSystem(theme)
+  let designSystem = buildDesignSystem(theme, utilitiesNode?.src)
 
   if (important) {
     designSystem.important = important
@@ -605,8 +620,27 @@ async function parseCss(
     sources,
   })
 
-  for (let customVariant of customVariants) {
-    customVariant(designSystem)
+  for (let name of customVariants.keys()) {
+    // Pre-register the variant to ensure its position in the variant list is
+    // based on the order we see them in the CSS.
+    designSystem.variants.static(name, () => {})
+  }
+
+  // Register custom variants in order
+  for (let variant of topologicalSort(customVariantDependencies, {
+    onCircularDependency(path, start) {
+      let output = toCss(
+        path.map((name, idx) => {
+          return atRule('@custom-variant', name, [atRule('@variant', path[idx + 1] ?? start, [])])
+        }),
+      )
+        .replaceAll(';', ' { … }')
+        .replace(`@custom-variant ${start} {`, `@custom-variant ${start} { /* ← */`)
+
+      throw new Error(`Circular dependency detected in custom variants:\n\n${output}`)
+    },
+  })) {
+    customVariants.get(variant)?.(designSystem)
   }
 
   for (let customUtility of customUtilities) {
@@ -636,30 +670,7 @@ async function parseCss(
     firstThemeRule.nodes = [context({ theme: true }, nodes)]
   }
 
-  // Replace the `@variant` at-rules with the actual variant rules.
-  if (variantNodes.length > 0) {
-    for (let variantNode of variantNodes) {
-      // Starting with the `&` rule node
-      let node = styleRule('&', variantNode.nodes)
-
-      let variant = variantNode.params
-
-      let variantAst = designSystem.parseVariant(variant)
-      if (variantAst === null) {
-        throw new Error(`Cannot use \`@variant\` with unknown variant: ${variant}`)
-      }
-
-      let result = applyVariant(node, variantAst, designSystem.variants)
-      if (result === null) {
-        throw new Error(`Cannot use \`@variant\` with variant: ${variant}`)
-      }
-
-      // Update the variant at-rule node, to be the `&` rule node
-      Object.assign(variantNode, node)
-    }
-    features |= Features.Variants
-  }
-
+  features |= substituteAtVariant(ast, designSystem)
   features |= substituteFunctions(ast, designSystem)
   features |= substituteAtApply(ast, designSystem)
 
@@ -673,11 +684,11 @@ async function parseCss(
 
   // Remove `@utility`, we couldn't replace it before yet because we had to
   // handle the nested `@apply` at-rules first.
-  walk(ast, (node, { replaceWith }) => {
+  walk(ast, (node) => {
     if (node.kind !== 'at-rule') return
 
     if (node.name === '@utility') {
-      replaceWith([])
+      return WalkAction.Replace([])
     }
 
     // The `@utility` has to be top-level, therefore we don't have to traverse
@@ -845,7 +856,7 @@ export async function compile(
 }
 
 export async function __unstable__loadDesignSystem(css: string, opts: CompileOptions = {}) {
-  let result = await parseCss(CSS.parse(css), opts)
+  let result = await parseCss(CSS.parse(css, { from: opts.from }), opts)
   return result.designSystem
 }
 

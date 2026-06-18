@@ -1,10 +1,11 @@
 import type { Features } from '..'
 import { substituteAtApply } from '../apply'
-import { atRule, decl, rule, walk, type AstNode } from '../ast'
+import { atRule, cloneAstNode, decl, rule, type AstNode } from '../ast'
 import type { Candidate, CandidateModifier, NamedUtilityValue } from '../candidate'
 import { substituteFunctions } from '../css-functions'
 import * as CSS from '../css-parser'
 import type { DesignSystem } from '../design-system'
+import * as SelectorParser from '../selector-parser'
 import type { SourceLocation } from '../source-maps/source'
 import { withAlpha } from '../utilities'
 import { DefaultMap } from '../utils/default-map'
@@ -13,9 +14,9 @@ import { inferDataType } from '../utils/infer-data-type'
 import { segment } from '../utils/segment'
 import { toKeyPath } from '../utils/to-key-path'
 import { compoundsForSelectors, IS_VALID_VARIANT_NAME, substituteAtSlot } from '../variants'
+import { walk, WalkAction } from '../walk'
 import type { ResolvedConfig, UserConfig } from './config/types'
 import { createThemeFn } from './plugin-functions'
-import * as SelectorParser from './selector-parser'
 
 export type Config = UserConfig
 export type PluginFn = (api: PluginAPI) => void
@@ -119,7 +120,7 @@ export function buildPluginApi({
     addVariant(name, variant) {
       if (!IS_VALID_VARIANT_NAME.test(name)) {
         throw new Error(
-          `\`addVariant('${name}')\` defines an invalid variant name. Variants should only contain alphanumeric, dashes or underscore characters.`,
+          `\`addVariant('${name}')\` defines an invalid variant name. Variants should only contain alphanumeric, dashes, or underscore characters and start with a lowercase letter or number.`,
         )
       }
 
@@ -154,7 +155,7 @@ export function buildPluginApi({
 
       // CSS-in-JS object
       else if (typeof variant === 'object') {
-        designSystem.variants.fromAst(name, objectToAst(variant))
+        designSystem.variants.fromAst(name, objectToAst(variant), designSystem)
       }
     },
     matchVariant(name, fn, options) {
@@ -201,12 +202,17 @@ export function buildPluginApi({
                 ruleNodes.nodes,
               )
             } else if (variant.value.kind === 'named' && options?.values) {
+              if (!Object.hasOwn(options.values, variant.value.value)) {
+                return null
+              }
               let defaultValue = options.values[variant.value.value]
               if (typeof defaultValue !== 'string') {
-                return
+                return null
               }
 
               ruleNodes.nodes = resolveVariantValue(defaultValue, variant.modifier, ruleNodes.nodes)
+            } else {
+              return null
             }
           })
         },
@@ -220,8 +226,14 @@ export function buildPluginApi({
           let aValueKey = a.value ? a.value.value : 'DEFAULT'
           let zValueKey = z.value ? z.value.value : 'DEFAULT'
 
-          let aValue = options?.values?.[aValueKey] ?? aValueKey
-          let zValue = options?.values?.[zValueKey] ?? zValueKey
+          let aValue =
+            (options?.values && Object.hasOwn(options.values, aValueKey)
+              ? options.values[aValueKey]
+              : undefined) ?? aValueKey
+          let zValue =
+            (options?.values && Object.hasOwn(options.values, zValueKey)
+              ? options.values[zValueKey]
+              : undefined) ?? zValueKey
 
           if (options && typeof options.sort === 'function') {
             return options.sort(
@@ -244,6 +256,10 @@ export function buildPluginApi({
           // variants and different (valid) variants cannot produce the same AST.
           return aValue < zValue ? -1 : 1
         },
+      )
+
+      designSystem.variants.suggest(name, () =>
+        Object.keys(options?.values ?? {}).filter((v) => v !== 'DEFAULT'),
       )
     },
 
@@ -275,7 +291,7 @@ export function buildPluginApi({
         let selectorAst = SelectorParser.parse(name)
         let foundValidUtility = false
 
-        SelectorParser.walk(selectorAst, (node) => {
+        walk(selectorAst, (node) => {
           if (
             node.kind === 'selector' &&
             node.value[0] === '.' &&
@@ -295,7 +311,7 @@ export function buildPluginApi({
           }
 
           if (node.kind === 'function' && node.value === ':not') {
-            return SelectorParser.SelectorWalkAction.Skip
+            return WalkAction.Skip
           }
         })
 
@@ -312,7 +328,7 @@ export function buildPluginApi({
           walk(ast, (node) => {
             if (node.kind === 'rule') {
               let selectorAst = SelectorParser.parse(node.selector)
-              SelectorParser.walk(selectorAst, (node) => {
+              walk(selectorAst, (node) => {
                 if (node.kind === 'selector' && node.value[0] === '.') {
                   node.value = `.${designSystem.theme.prefix}\\:${node.value.slice(1)}`
                 }
@@ -323,7 +339,7 @@ export function buildPluginApi({
         }
 
         designSystem.utilities.static(className, (candidate) => {
-          let clonedAst = structuredClone(ast)
+          let clonedAst = ast.map(cloneAstNode)
           replaceNestedClassNameReferences(clonedAst, className, candidate.raw)
           featuresRef.current |= substituteAtApply(clonedAst, designSystem)
           return clonedAst
@@ -399,10 +415,13 @@ export function buildPluginApi({
                 value = values.DEFAULT ?? null
               } else if (candidate.value.kind === 'arbitrary') {
                 value = candidate.value.value
-              } else if (candidate.value.fraction && values[candidate.value.fraction]) {
+              } else if (
+                candidate.value.fraction &&
+                Object.hasOwn(values, candidate.value.fraction)
+              ) {
                 value = values[candidate.value.fraction]
                 ignoreModifier = true
-              } else if (values[candidate.value.value]) {
+              } else if (Object.hasOwn(values, candidate.value.value)) {
                 value = values[candidate.value.value]
               } else if (values.__BARE_VALUE__) {
                 value = values.__BARE_VALUE__(candidate.value) ?? null
@@ -423,7 +442,7 @@ export function buildPluginApi({
                 modifier = null
               } else if (modifiers === 'any' || candidate.modifier.kind === 'arbitrary') {
                 modifier = candidate.modifier.value
-              } else if (modifiers?.[candidate.modifier.value]) {
+              } else if (modifiers && Object.hasOwn(modifiers, candidate.modifier.value)) {
                 modifier = modifiers[candidate.modifier.value]
               } else if (isColor && !Number.isNaN(Number(candidate.modifier.value))) {
                 modifier = `${candidate.modifier.value}%`
@@ -465,6 +484,10 @@ export function buildPluginApi({
           // The `__BARE_VALUE__` key is a special key used to ensure bare values
           // work even with legacy configs and plugins
           valueKeys.delete('__BARE_VALUE__')
+
+          // The `__CSS_VALUES__` key is a special key used by the theme function
+          // to transport `@theme` metadata about values from CSS
+          valueKeys.delete('__CSS_VALUES__')
 
           // The `DEFAULT` key is represented as `null` in the utility API
           if (valueKeys.has('DEFAULT')) {
@@ -602,7 +625,7 @@ function replaceNestedClassNameReferences(
   walk(ast, (node) => {
     if (node.kind === 'rule') {
       let selectorAst = SelectorParser.parse(node.selector)
-      SelectorParser.walk(selectorAst, (node) => {
+      walk(selectorAst, (node) => {
         if (node.kind === 'selector' && node.value === `.${utilityName}`) {
           node.value = `.${escape(rawCandidate)}`
         }

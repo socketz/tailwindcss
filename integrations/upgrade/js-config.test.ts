@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { describe } from 'vitest'
-import { css, html, json, test, ts } from '../utils'
+import { css, html, json, test, ts, txt } from '../utils'
 
 test(
   `upgrade JS config files with flat theme values, darkMode, and content fields`,
@@ -33,6 +33,9 @@ test(
               superRed: '#ff0000',
               steel: 'rgb(70 130 180 / <alpha-value>)',
               smoke: 'rgba(245, 245, 245, var(--smoke-alpha, <alpha-value>))',
+            },
+            ringColor: {
+              DEFAULT: '#c0ffee',
             },
             opacity: {
               superOpaque: '0.95',
@@ -167,9 +170,9 @@ test(
       "
       --- src/index.html ---
       <div
-        class="[letter-spacing:var(--tracking-super-wide)] [line-height:var(--leading-super-loose)]"
+        class="tracking-superWide leading-superLoose"
       ></div>
-      <div class="text-super-red/super-opaque leading-super-loose"></div>
+      <div class="text-superRed/superOpaque leading-superLoose"></div>
 
       --- src/input.css ---
       @import 'tailwindcss';
@@ -187,12 +190,14 @@ test(
         --color-red-500: #ef4444;
         --color-red-600: #dc2626;
 
-        --color-super-red: #ff0000;
+        --color-superRed: #ff0000;
         --color-steel: rgb(70 130 180);
         --color-smoke: rgba(245, 245, 245, var(--smoke-alpha, 1));
 
+        --default-ring-color: #c0ffee;
+
         --opacity-*: initial;
-        --opacity-super-opaque: 95%;
+        --opacity-superOpaque: 95%;
 
         --text-*: initial;
         --text-xs: 0.75rem;
@@ -265,9 +270,9 @@ test(
         --animate-spin-clockwise: spin-clockwise 1s linear infinite;
         --animate-spin-counterclockwise: spin-counterclockwise 1s linear infinite;
 
-        --tracking-super-wide: 0.25em;
+        --tracking-superWide: 0.25em;
 
-        --leading-super-loose: 3;
+        --leading-superLoose: 3;
 
         @keyframes spin-clockwise {
           0% {
@@ -314,6 +319,105 @@ test(
     `)
 
     expect((await fs.dumpFiles('tailwind.config.ts')).trim()).toBe('')
+  },
+)
+
+test(
+  'skips gitignored template files even when they are explicitly referenced in `content`',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      '.gitignore': txt`
+        node_modules
+        src/ignored
+      `,
+      'tailwind.config.ts': ts`
+        import { type Config } from 'tailwindcss'
+
+        module.exports = {
+          content: [
+            './src/migrate-me.html',
+            './src/ignored/do-not-migrate-me.html',
+            './node_modules/my-external-lib/template.html',
+          ],
+          theme: {},
+          plugins: [],
+        } satisfies Config
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+      'src/migrate-me.html': html`
+        <div class="order-[0]"></div>
+      `,
+      'src/ignored/do-not-migrate-me.html': html`
+        <div class="order-[0]"></div>
+      `,
+      'node_modules/my-external-lib/template.html': html`
+        <div
+          class="order-[0]"
+        ></div>
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(
+      await fs.dumpFiles(
+        '{src/**/*.{css,html},node_modules/my-external-lib/template.html,.gitignore}',
+      ),
+    ).toMatchInlineSnapshot(`
+      "
+      --- .gitignore ---
+      node_modules
+      src/ignored
+
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @source './ignored/do-not-migrate-me.html';
+      @source '../node_modules/my-external-lib/template.html';
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+
+      --- src/migrate-me.html ---
+      <div class="order-0"></div>
+
+      --- node_modules/my-external-lib/template.html ---
+      <div
+        class="order-[0]"
+      ></div>
+
+      --- src/ignored/do-not-migrate-me.html ---
+      <div class="order-[0]"></div>
+      "
+    `)
   },
 )
 
@@ -941,6 +1045,252 @@ test(
 
       @theme {
         --color-primary: red;
+      }
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+  },
+)
+
+test(
+  'migrate aria theme keys to custom variants',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        export default {
+          content: {
+            relative: true,
+            files: ['./src/**/*.html'],
+          },
+          theme: {
+            extend: {
+              aria: {
+                // Built-in (not really, but visible because of intellisense)
+                busy: 'busy="true"',
+
+                // Automatically handled by bare values
+                foo: 'foo="true"',
+
+                // Quotes are optional in CSS for these kinds of attribute
+                // selectors
+                bar: 'bar=true',
+
+                // Not automatically handled by bare values because names differ
+                baz: 'qux="true"',
+
+                // Completely custom
+                asc: 'sort="ascending"',
+                desc: 'sort="descending"',
+              },
+            },
+          },
+        }
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @custom-variant aria-baz (&[aria-qux="true"]);
+      @custom-variant aria-asc (&[aria-sort="ascending"]);
+      @custom-variant aria-desc (&[aria-sort="descending"]);
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+  },
+)
+
+test(
+  'migrate data theme keys to custom variants',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        export default {
+          content: {
+            relative: true,
+            files: ['./src/**/*.html'],
+          },
+          theme: {
+            extend: {
+              data: {
+                // Automatically handled by bare values
+                foo: 'foo',
+
+                // Not automatically handled by bare values because names differ
+                bar: 'baz',
+
+                // Custom
+                checked: 'ui~="checked"',
+              },
+            },
+          },
+        }
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @custom-variant data-bar (&[data-baz]);
+      @custom-variant data-checked (&[data-ui~="checked"]);
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+  },
+)
+
+test(
+  'migrate supports theme keys to custom variants',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        export default {
+          content: {
+            relative: true,
+            files: ['./src/**/*.html'],
+          },
+          theme: {
+            extend: {
+              supports: {
+                // Automatically handled by bare values (using CSS variable as the value)
+                foo: 'foo: var(--foo)', // parentheses are optional
+                bar: '(bar: var(--bar))',
+
+                // Not automatically handled by bare values because names differ
+                foo: 'bar: var(--foo)', // parentheses are optional
+                bar: '(qux: var(--bar))',
+
+                // Custom
+                grid: 'display: grid',
+              },
+            },
+          },
+        }
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @custom-variant supports-foo {
+        @supports (bar: var(--foo)) {
+          @slot;
+        }
+      }
+      @custom-variant supports-bar {
+        @supports ((qux: var(--bar))) {
+          @slot;
+        }
+      }
+      @custom-variant supports-grid {
+        @supports (display: grid) {
+          @slot;
+        }
       }
 
       /*
@@ -1595,3 +1945,243 @@ describe('border compatibility', () => {
     },
   )
 })
+
+test(
+  `future and experimental keys are supported`,
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        import { type Config } from 'tailwindcss'
+        import defaultTheme from 'tailwindcss/defaultTheme'
+
+        module.exports = {
+          darkMode: 'selector',
+          content: ['./src/**/*.{html,js}'],
+          future: {
+            hoverOnlyWhenSupported: true,
+            respectDefaultRingColorOpacity: true,
+            disableColorOpacityUtilitiesByDefault: true,
+            relativeContentPathsByDefault: true,
+          },
+          experimental: {
+            generalizedModifiers: true,
+          },
+          theme: {
+            colors: {
+              red: {
+                400: '#f87171',
+                500: 'red',
+              },
+            },
+          },
+          plugins: [],
+        } satisfies Config
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/**/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @custom-variant dark (&:where(.dark, .dark *));
+
+      @theme {
+        --color-*: initial;
+        --color-red-400: #f87171;
+        --color-red-500: red;
+      }
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+
+    expect((await fs.dumpFiles('tailwind.config.ts')).trim()).toBe('')
+  },
+)
+
+test(
+  `unknown future keys dont migrate the config`,
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        import { type Config } from 'tailwindcss'
+        import defaultTheme from 'tailwindcss/defaultTheme'
+
+        module.exports = {
+          darkMode: 'selector',
+          content: ['./src/**/*.{html,js}'],
+          future: {
+            something: true,
+          },
+        } satisfies Config
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/**/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @config '../tailwind.config.ts';
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+
+    expect((await fs.dumpFiles('tailwind.config.ts')).trim()).toMatchInlineSnapshot(`
+      "--- tailwind.config.ts ---
+      import { type Config } from 'tailwindcss'
+      import defaultTheme from 'tailwindcss/defaultTheme'
+
+      module.exports = {
+        darkMode: 'selector',
+        content: ['./src/**/*.{html,js}'],
+        future: {
+          something: true,
+        },
+      } satisfies Config"
+    `)
+  },
+)
+
+test(
+  `unknown experimental keys dont migrate the config`,
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "^3",
+            "@tailwindcss/upgrade": "workspace:^"
+          }
+        }
+      `,
+      'tailwind.config.ts': ts`
+        import { type Config } from 'tailwindcss'
+        import defaultTheme from 'tailwindcss/defaultTheme'
+
+        module.exports = {
+          darkMode: 'selector',
+          content: ['./src/**/*.{html,js}'],
+          experimental: {
+            something: true,
+          },
+        } satisfies Config
+      `,
+      'src/input.css': css`
+        @tailwind base;
+        @tailwind components;
+        @tailwind utilities;
+      `,
+    },
+  },
+  async ({ exec, fs, expect }) => {
+    await exec('npx @tailwindcss/upgrade')
+
+    expect(await fs.dumpFiles('src/**/*.css')).toMatchInlineSnapshot(`
+      "
+      --- src/input.css ---
+      @import 'tailwindcss';
+
+      @config '../tailwind.config.ts';
+
+      /*
+        The default border color has changed to \`currentcolor\` in Tailwind CSS v4,
+        so we've added these compatibility styles to make sure everything still
+        looks the same as it did with Tailwind CSS v3.
+
+        If we ever want to remove these styles, we need to add an explicit border
+        color utility to any element that depends on these defaults.
+      */
+      @layer base {
+        *,
+        ::after,
+        ::before,
+        ::backdrop,
+        ::file-selector-button {
+          border-color: var(--color-gray-200, currentcolor);
+        }
+      }
+      "
+    `)
+
+    expect((await fs.dumpFiles('tailwind.config.ts')).trim()).toMatchInlineSnapshot(`
+      "--- tailwind.config.ts ---
+      import { type Config } from 'tailwindcss'
+      import defaultTheme from 'tailwindcss/defaultTheme'
+
+      module.exports = {
+        darkMode: 'selector',
+        content: ['./src/**/*.{html,js}'],
+        experimental: {
+          something: true,
+        },
+      } satisfies Config"
+    `)
+  },
+)

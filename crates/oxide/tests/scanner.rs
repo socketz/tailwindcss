@@ -20,6 +20,16 @@ mod scanner {
         result
     }
 
+    fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> std::io::Result<()> {
+        #[cfg(not(windows))]
+        let result = std::os::unix::fs::symlink(original, link);
+
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(original, link);
+
+        result
+    }
+
     fn public_source_entry_from_pattern(dir: PathBuf, pattern: &str) -> PublicSourceEntry {
         let mut parts = pattern.split_whitespace();
         let _ = parts.next().unwrap_or_default();
@@ -61,6 +71,41 @@ mod scanner {
         }
     }
 
+    fn scanned_files(scanner: &mut Scanner, base: &Path) -> Vec<String> {
+        let base_dir =
+            format!("{}{}", dunce::canonicalize(base).unwrap().display(), "/").replace('\\', "/");
+
+        let mut files = scanner
+            .get_files()
+            .iter()
+            // Normalize paths to use unix style separators
+            .map(|file| file.replace('\\', "/").replace(&base_dir, ""))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn scanned_globs(scanner: &mut Scanner, base: &Path) -> Vec<String> {
+        let base_dir =
+            format!("{}{}", dunce::canonicalize(base).unwrap().display(), "/").replace('\\', "/");
+
+        let mut globs = scanner
+            .get_globs()
+            .iter()
+            .map(|glob| {
+                if glob.pattern.starts_with('/') {
+                    format!("{}{}", glob.base, glob.pattern)
+                } else {
+                    format!("{}/{}", glob.base, glob.pattern)
+                }
+            })
+            // Normalize paths to use unix style separators
+            .map(|file| file.replace('\\', "/").replace(&base_dir, ""))
+            .collect::<Vec<_>>();
+        globs.sort();
+        globs
+    }
+
     fn scan_with_globs(
         paths_with_content: &[(&str, &str)],
         source_directives: Vec<&str>,
@@ -85,34 +130,14 @@ mod scanner {
         let mut scanner = Scanner::new(sources);
 
         let candidates = scanner.scan();
-
         let base_dir =
             format!("{}{}", dunce::canonicalize(&base).unwrap().display(), "/").replace('\\', "/");
 
         // Get all scanned files as strings relative to the base directory
-        let mut files = scanner
-            .get_files()
-            .iter()
-            // Normalize paths to use unix style separators
-            .map(|file| file.replace('\\', "/").replace(&base_dir, ""))
-            .collect::<Vec<_>>();
-        files.sort();
+        let files = scanned_files(&mut scanner, Path::new(&base));
 
         // Get all scanned globs as strings relative to the base directory
-        let mut globs = scanner
-            .get_globs()
-            .iter()
-            .map(|glob| {
-                if glob.pattern.starts_with('/') {
-                    format!("{}{}", glob.base, glob.pattern)
-                } else {
-                    format!("{}/{}", glob.base, glob.pattern)
-                }
-            })
-            // Normalize paths to use unix style separators
-            .map(|file| file.replace('\\', "/").replace(&base_dir, ""))
-            .collect::<Vec<_>>();
-        globs.sort();
+        let globs = scanned_globs(&mut scanner, Path::new(&base));
 
         // Get all normalized sources as strings relative to the base directory
         let mut normalized_sources = scanner
@@ -547,6 +572,36 @@ mod scanner {
     }
 
     #[test]
+    fn it_should_preserve_source_order_when_referencing_a_sibling_project() {
+        // Create a temporary working directory
+        let dir = tempdir().unwrap().into_path();
+
+        // Create files
+        create_files_in(
+            &dir,
+            &[
+                ("project-a/src/index.css", ""),
+                ("project-b/keep/keep.html", "content-['GOOD-1']"),
+                ("project-b/ignored/ignored.html", "content-['BAD-1']"),
+                ("project-b/ignored/except.html", "content-['GOOD-2']"),
+            ],
+        );
+
+        let base = dir.join("project-a/src");
+        let mut scanner = Scanner::new(vec![
+            public_source_entry_from_pattern(base.clone(), "@source '../../project-b'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../../project-b/ignored'"),
+            public_source_entry_from_pattern(
+                base.clone(),
+                "@source '../../project-b/ignored/except.html'",
+            ),
+        ]);
+        let candidates = scanner.scan();
+
+        assert_eq!(candidates, vec!["content-['GOOD-1']", "content-['GOOD-2']"]);
+    }
+
+    #[test]
     fn it_should_scan_files_without_extensions() {
         // These look like folders, but they are files
         let ScanResult {
@@ -617,6 +672,36 @@ mod scanner {
 
         assert_eq!(candidates, vec!["content-['foo.styl']"]);
         assert_eq!(normalized_sources, vec!["**/*", "*.styl"]);
+    }
+
+    #[test]
+    fn it_should_preserve_paths_for_sources_ending_in_a_deep_glob() {
+        let ScanResult {
+            candidates,
+            files,
+            globs,
+            normalized_sources,
+        } = scan_with_globs(
+            &[
+                (
+                    "blog/2024/foo/bar/baz/index.html",
+                    "content-['blog/2024/foo/bar/baz/index.html']",
+                ),
+                (
+                    "blog/2024/foo/bar/qux/index.html",
+                    "content-['blog/2024/foo/bar/qux/index.html']",
+                ),
+            ],
+            vec!["@source './blog/*/foo/bar/baz/**/*'"],
+        );
+
+        assert_eq!(
+            candidates,
+            vec!["content-['blog/2024/foo/bar/baz/index.html']"]
+        );
+        assert_eq!(files, vec!["blog/2024/foo/bar/baz/index.html"]);
+        assert_eq!(globs, vec!["blog/*/foo/bar/baz/**/*"]);
+        assert_eq!(normalized_sources, vec!["blog/*/foo/bar/baz/**/*"]);
     }
 
     #[test]
@@ -838,6 +923,126 @@ mod scanner {
                 "content-['project-b/sub1/sub2/new.html']"
             ]
         );
+    }
+
+    #[test]
+    fn it_should_remove_deleted_files_from_scanned_files() {
+        // Create a temporary working directory
+        let dir = tempdir().unwrap().into_path();
+
+        // Initialize this directory as a git repository
+        let _ = Command::new("git").arg("init").current_dir(&dir).output();
+
+        // Create files
+        create_files_in(
+            &dir,
+            &[
+                ("src/index.html", "content-['src/index.html']"),
+                ("src/keep.html", "content-['src/keep.html']"),
+                ("src/remove.html", "content-['src/remove.html']"),
+            ],
+        );
+
+        let mut scanner = Scanner::new(vec![public_source_entry_from_pattern(
+            dir.clone(),
+            "@source '**/*'",
+        )]);
+
+        scanner.scan();
+        assert_eq!(
+            scanned_files(&mut scanner, &dir),
+            vec!["src/index.html", "src/keep.html", "src/remove.html"]
+        );
+
+        fs::remove_file(dir.join("src/remove.html")).unwrap();
+
+        scanner.scan();
+        assert_eq!(
+            scanned_files(&mut scanner, &dir),
+            vec!["src/index.html", "src/keep.html"]
+        );
+    }
+
+    #[test]
+    fn it_should_remove_deleted_directories_from_scanned_files() {
+        // Create a temporary working directory
+        let dir = tempdir().unwrap().into_path();
+
+        // Initialize this directory as a git repository
+        let _ = Command::new("git").arg("init").current_dir(&dir).output();
+
+        // Create files
+        create_files_in(
+            &dir,
+            &[
+                ("src/index.html", "content-['src/index.html']"),
+                ("src/keep/index.html", "content-['src/keep/index.html']"),
+                ("src/remove/index.html", "content-['src/remove/index.html']"),
+                (
+                    "src/remove/nested/index.html",
+                    "content-['src/remove/nested/index.html']",
+                ),
+            ],
+        );
+
+        let mut scanner = Scanner::new(vec![public_source_entry_from_pattern(
+            dir.clone(),
+            "@source '**/*'",
+        )]);
+
+        scanner.scan();
+        assert_eq!(
+            scanned_files(&mut scanner, &dir),
+            vec![
+                "src/index.html",
+                "src/keep/index.html",
+                "src/remove/index.html",
+                "src/remove/nested/index.html",
+            ]
+        );
+
+        fs::remove_dir_all(dir.join("src/remove")).unwrap();
+
+        scanner.scan();
+        assert_eq!(
+            scanned_files(&mut scanner, &dir),
+            vec!["src/index.html", "src/keep/index.html"]
+        );
+    }
+
+    #[test]
+    fn it_should_remove_deleted_directories_from_scanned_globs() {
+        // Create a temporary working directory
+        let dir = tempdir().unwrap().into_path();
+
+        // Initialize this directory as a git repository
+        let _ = Command::new("git").arg("init").current_dir(&dir).output();
+
+        // Create files
+        create_files_in(
+            &dir,
+            &[
+                ("index.html", "content-['index.html']"),
+                ("src/index.html", "content-['src/index.html']"),
+            ],
+        );
+
+        let mut scanner = Scanner::new(vec![public_source_entry_from_pattern(
+            dir.clone(),
+            "@source '**/*'",
+        )]);
+
+        scanner.scan();
+
+        let globs = scanned_globs(&mut scanner, &dir);
+        assert!(globs.iter().any(|glob| glob.starts_with("src/**/*")));
+
+        fs::remove_dir_all(dir.join("src")).unwrap();
+
+        scanner.scan();
+
+        let globs = scanned_globs(&mut scanner, &dir);
+        assert!(!globs.iter().any(|glob| glob.starts_with("src/**/*")));
     }
 
     #[test]
@@ -1474,6 +1679,30 @@ mod scanner {
         );
     }
 
+    // https://github.com/tailwindlabs/tailwindcss/issues/19844
+    #[test]
+    fn test_allow_explicit_sources_ignored_by_allow_list_gitignore() {
+        let ScanResult { candidates, .. } = scan_with_globs(
+            &[
+                (".gitignore", "*\n!/app\n!/app/design\n!/app/design/**\n"),
+                (
+                    "app/design/frontend/theme/templates/component.phtml",
+                    "content-['app/design/frontend/theme/templates/component.phtml']",
+                ),
+                (
+                    "vendor/acme/theme/module/templates/component.phtml",
+                    "content-['vendor/acme/theme/module/templates/component.phtml']",
+                ),
+            ],
+            vec!["@source 'vendor/acme/theme'"],
+        );
+
+        assert_eq!(
+            candidates,
+            vec!["content-['vendor/acme/theme/module/templates/component.phtml']"]
+        );
+    }
+
     #[test]
     fn test_ignore_node_modules_without_gitignore() {
         let ScanResult {
@@ -1759,6 +1988,88 @@ mod scanner {
         let candidates = scanner.scan();
 
         assert_eq!(candidates, vec!["content-['abcd/xyz.html']"]);
+    }
+
+    #[test]
+    fn test_symlinked_sources_within_the_scanned_tree_can_be_ignored() {
+        let dir = tempdir().unwrap().into_path();
+        create_files_in(
+            &dir,
+            &[
+                ("src/keep.html", "content-['src/keep.html']"),
+                (
+                    "actual-dir/ignore.html",
+                    "content-['actual-dir/ignore.html']",
+                ),
+                ("actual-file.html", "content-['actual-file.html']"),
+            ],
+        );
+
+        let _ = symlink(dir.join("actual-dir"), dir.join("linked-dir"));
+        let _ = symlink_file(dir.join("actual-file.html"), dir.join("linked-file.html"));
+
+        let base = dir.join("src");
+        let mut scanner = Scanner::new(vec![
+            public_source_entry_from_pattern(base.clone(), "@source '../**/*'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../actual-dir'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../linked-dir'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../actual-file.html'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../linked-file.html'"),
+        ]);
+        let candidates = scanner.scan();
+
+        assert_eq!(candidates, vec!["content-['src/keep.html']"]);
+
+        let mut scanner = Scanner::new(vec![
+            public_source_entry_from_pattern(base.clone(), "@source '../**/*'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../actual-dir/**/*.html'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../linked-dir/**/*.html'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../actual-file.html'"),
+            public_source_entry_from_pattern(base.clone(), "@source not '../linked-file.html'"),
+        ]);
+        let candidates = scanner.scan();
+
+        assert_eq!(candidates, vec!["content-['src/keep.html']"]);
+    }
+
+    #[test]
+    fn test_symlinked_sources_outside_the_scanned_tree_can_be_ignored() {
+        let dir = tempdir().unwrap().into_path();
+        create_files_in(
+            &dir,
+            &[
+                (
+                    "actual-dir/ignore.html",
+                    "content-['actual-dir/ignore.html']",
+                ),
+                ("project/keep.html", "content-['project/keep.html']"),
+            ],
+        );
+
+        let _ = symlink(dir.join("actual-dir"), dir.join("project/linked-dir"));
+
+        let base = dir.join("project");
+        let mut scanner = Scanner::new(vec![public_source_entry_from_pattern(
+            base.clone(),
+            "@source '**/*'",
+        )]);
+        let candidates = scanner.scan();
+
+        assert_eq!(
+            candidates,
+            vec![
+                "content-['actual-dir/ignore.html']",
+                "content-['project/keep.html']",
+            ]
+        );
+
+        let mut scanner = Scanner::new(vec![
+            public_source_entry_from_pattern(base.clone(), "@source '**/*'"),
+            public_source_entry_from_pattern(base.clone(), "@source not 'linked-dir'"),
+        ]);
+        let candidates = scanner.scan();
+
+        assert_eq!(candidates, vec!["content-['project/keep.html']"]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
-use crate::glob::split_pattern;
 use crate::GlobEntry;
 use bexpand::Expression;
-use std::path::PathBuf;
+use fxhash::FxHashMap;
+use ignore::gitignore::Gitignore;
+use std::path::{Component, Path, PathBuf};
 use tracing::{event, Level};
 
 use super::auto_source_detection::IGNORED_CONTENT_DIRS;
@@ -49,13 +50,14 @@ pub enum SourceEntry {
     /// ```
     Ignored { base: PathBuf, pattern: String },
 
-    /// External sources are sources outside of your git root which should not
-    /// follow gitignore rules.
+    /// External sources are directories that are ignored (by us or .gitignore rules), but should be
+    /// included bypassing the default ignore rules.
     ///
     /// Represented by:
     ///
     /// ```css
     /// @source "../node_modules/my-lib";`
+    /// @source "../node_modules/my-lib/**/*";`
     /// ```
     External { base: PathBuf },
 }
@@ -102,72 +104,289 @@ impl PublicSourceEntry {
     /// resolved path.
     pub fn optimize(&mut self) {
         // Resolve base path immediately
-        let Ok(base) = dunce::canonicalize(&self.base) else {
+        let Ok(mut base) = dunce::canonicalize(&self.base) else {
             event!(Level::ERROR, "Failed to resolve base: {:?}", self.base);
             return;
         };
-        self.base = base.to_string_lossy().to_string();
 
-        // No dynamic part, figure out if we are dealing with a file or a directory.
-        if !self.pattern.contains('*') {
-            let combined_path = if self.pattern.starts_with("/") {
-                PathBuf::from(&self.pattern)
-            } else {
-                PathBuf::from(&self.base).join(&self.pattern)
-            };
-
-            match dunce::canonicalize(combined_path) {
-                Ok(resolved_path) if resolved_path.is_dir() => {
-                    self.base = resolved_path.to_string_lossy().to_string();
-                    self.pattern = "**/*".to_owned();
-                }
-                Ok(resolved_path) if resolved_path.is_file() => {
-                    self.base = resolved_path
-                        .parent()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string();
-                    // Ensure leading slash, otherwise it will match against all files in all folders/
-                    self.pattern =
-                        format!("/{}", resolved_path.file_name().unwrap().to_string_lossy());
-                }
-                _ => {}
-            }
-            return;
+        let mut new_pattern = PathBuf::new();
+        enum ComponentStage {
+            Base,
+            Pattern,
         }
+        let mut stage = ComponentStage::Base;
 
-        // Contains dynamic part
-        let (static_part, dynamic_part) = split_pattern(&self.pattern);
+        let mut components = Path::new(&self.pattern).components().peekable();
+        while let Some(component) = components.next() {
+            match stage {
+                ComponentStage::Base => {
+                    match component {
+                        // Ignore the current dir, e.g. `.`
+                        Component::CurDir => {}
 
-        let base: PathBuf = self.base.clone().into();
-        let base = match static_part {
-            Some(static_part) => {
-                // TODO: If the base does not exist on disk, try removing the last slash and try
-                // again.
-                match dunce::canonicalize(base.join(static_part)) {
-                    Ok(base) => base,
-                    Err(err) => {
-                        event!(tracing::Level::ERROR, "Failed to resolve glob: {:?}", err);
-                        return;
+                        // Go up a directory, e.g. `..`
+                        Component::ParentDir => {
+                            base.pop();
+                        }
+
+                        // Once we hit a component that contains a wildcard character, then we
+                        // can't change the base anymore and we must move to the pattern part.
+                        Component::Normal(part) if part.to_string_lossy().contains("*") => {
+                            new_pattern.push(component);
+                            stage = ComponentStage::Pattern;
+                        }
+
+                        // File or folder, but not the last component
+                        Component::Normal(part) if components.peek().is_some() => {
+                            base.push(part);
+                        }
+
+                        // Last file or folder. If it's a folder, we move it to the base,
+                        // otherwise we move it to the pattern.
+                        Component::Normal(part) => {
+                            let full_path = base.join(part);
+                            if full_path.is_dir() {
+                                base.push(part);
+                            } else {
+                                new_pattern.push(part);
+                            }
+                        }
+
+                        // When we're dealing with an absolute path, then we have to bypass the
+                        // `base` entirely.
+                        Component::Prefix(_) => {
+                            base.clear();
+                            base.push(component);
+                        }
+                        Component::RootDir => {
+                            #[cfg(not(windows))]
+                            base.clear();
+                            base.push(component);
+                        }
                     }
                 }
-            }
-            None => base,
-        };
-
-        let pattern = match dynamic_part {
-            Some(dynamic_part) => dynamic_part,
-            None => {
-                if base.is_dir() {
-                    "**/*".to_owned()
-                } else {
-                    "".to_owned()
+                ComponentStage::Pattern => {
+                    new_pattern.push(component);
                 }
             }
-        };
+        }
 
         self.base = base.to_string_lossy().to_string();
-        self.pattern = pattern;
+        self.pattern = path_to_posix_string(&new_pattern);
+
+        // Ensure we have `**/*` when the base is a folder and we don't have a pattern at all
+        if self.pattern == "" {
+            self.pattern = "/**/*".to_owned();
+        }
+        // Ensure that the pattern is pinned to the base path.
+        else if !self.pattern.starts_with("/") {
+            self.pattern = format!("/{}", self.pattern);
+        }
+    }
+}
+
+fn path_to_posix_string(path: &Path) -> String {
+    let mut parts = Vec::new();
+    let mut is_rooted = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                parts.push(prefix.as_os_str().to_string_lossy().to_string());
+            }
+            Component::RootDir => {
+                is_rooted = true;
+                if parts.is_empty() {
+                    parts.push(String::new());
+                }
+            }
+            Component::CurDir => {
+                parts.push(".".to_string());
+            }
+            Component::ParentDir => {
+                parts.push("..".to_string());
+            }
+            Component::Normal(part) => {
+                parts.push(part.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let result = parts.join("/");
+    if result.is_empty() && is_rooted {
+        "/".to_string()
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn path_to_posix_string_serializes_relative_paths() {
+        let path = PathBuf::from("src").join("**").join("*.html");
+
+        assert_eq!(path_to_posix_string(&path), "src/**/*.html");
+    }
+
+    #[test]
+    fn path_to_posix_string_serializes_rooted_paths() {
+        let path = PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+            .join("src")
+            .join("**")
+            .join("*.html");
+
+        assert_eq!(path_to_posix_string(&path), "/src/**/*.html");
+    }
+
+    #[test]
+    fn path_to_posix_string_serializes_empty_paths() {
+        assert_eq!(path_to_posix_string(&PathBuf::new()), "");
+    }
+
+    #[test]
+    fn optimize_hoists_static_directories_and_keeps_files_in_the_pattern() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src").join("examples")).unwrap();
+
+        let mut source = PublicSourceEntry {
+            base: dir.path().to_string_lossy().to_string(),
+            pattern: "src/examples/index.html".to_string(),
+            negated: false,
+        };
+
+        source.optimize();
+
+        assert_eq!(
+            source.base,
+            dunce::canonicalize(dir.path().join("src").join("examples"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(source.pattern, "/index.html");
+    }
+
+    #[test]
+    fn optimize_hoists_folder_patterns() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src").join("examples")).unwrap();
+
+        let mut source = PublicSourceEntry {
+            base: dir.path().to_string_lossy().to_string(),
+            pattern: "src/examples".to_string(),
+            negated: false,
+        };
+
+        source.optimize();
+
+        assert_eq!(
+            source.base,
+            dunce::canonicalize(dir.path().join("src").join("examples"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(source.pattern, "/**/*");
+    }
+
+    #[test]
+    fn optimize_keeps_wildcards_in_the_pattern() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let mut source = PublicSourceEntry {
+            base: dir.path().to_string_lossy().to_string(),
+            pattern: "src/**/*.html".to_string(),
+            negated: false,
+        };
+
+        source.optimize();
+
+        assert_eq!(
+            source.base,
+            dunce::canonicalize(dir.path().join("src"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(source.pattern, "/**/*.html");
+    }
+
+    /// Run the public-to-private conversion for an auto-detected source pointing at `base` and
+    /// return the resulting entry.
+    fn auto_source_entry(base: &Path) -> SourceEntry {
+        public_source_entries_to_private_source_entries(vec![PublicSourceEntry {
+            base: base.to_string_lossy().to_string(),
+            pattern: "**/*".to_string(),
+            negated: false,
+        }])
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_detected_folders_become_auto_sources() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("src");
+        fs::create_dir_all(&base).unwrap();
+        let base = dunce::canonicalize(&base).unwrap();
+
+        assert_eq!(auto_source_entry(&base), SourceEntry::Auto { base });
+    }
+
+    #[test]
+    fn folders_ignored_by_default_become_external_sources() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("node_modules").join("my-lib");
+        fs::create_dir_all(&base).unwrap();
+        let base = dunce::canonicalize(&base).unwrap();
+
+        assert_eq!(auto_source_entry(&base), SourceEntry::External { base });
+    }
+
+    #[test]
+    fn folders_ignored_by_gitignore_become_external_sources() {
+        let dir = tempdir().unwrap();
+        // Pretend this is a git repository so the `.gitignore` search is bounded to it.
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+
+        let base = dir.path().join("dist");
+        fs::create_dir_all(&base).unwrap();
+        let base = dunce::canonicalize(&base).unwrap();
+
+        assert_eq!(auto_source_entry(&base), SourceEntry::External { base });
+    }
+
+    #[test]
+    fn folders_ignored_by_a_parent_gitignore_become_external_sources() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        // A `.gitignore` higher up in the tree should still apply to nested directories.
+        fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+
+        let base = dir.path().join("packages").join("app").join("generated");
+        fs::create_dir_all(&base).unwrap();
+        let base = dunce::canonicalize(&base).unwrap();
+
+        assert_eq!(auto_source_entry(&base), SourceEntry::External { base });
+    }
+
+    #[test]
+    fn folders_not_ignored_by_gitignore_stay_auto_sources() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+
+        let base = dir.path().join("src");
+        fs::create_dir_all(&base).unwrap();
+        let base = dunce::canonicalize(&base).unwrap();
+
+        assert_eq!(auto_source_entry(&base), SourceEntry::Auto { base });
     }
 }
 
@@ -218,18 +437,90 @@ pub fn public_source_entries_to_private_source_entries(
         })
         .collect::<Vec<_>>();
 
+    // Compiled `.gitignore` matchers are cached per directory so we read and parse each
+    // `.gitignore` file at most once, even though entries commonly share ancestor directories
+    // (e.g. the repository root). A cached `None` means the directory has no `.gitignore` file.
+    let mut gitignores: FxHashMap<PathBuf, Option<Gitignore>> = FxHashMap::default();
+
+    // Boundary for the `.gitignore` walk when a source is not inside a git repository (see
+    // below).
+    let cwd = std::env::current_dir()
+        .map(|cwd| dunce::canonicalize(&cwd).unwrap_or(cwd))
+        .ok();
+
     // Convert from public SourceEntry to private SourceEntry
     expanded_globs
         .into_iter()
-        .map(Into::into)
-        .collect::<Vec<_>>()
+        .map(|public_source| {
+            let mut source: SourceEntry = public_source.into();
+
+            // Promote auto-sources to external sources if they were gitignored
+            if let SourceEntry::Auto { ref base } = source {
+                let inside_git_repo = base.ancestors().any(|dir| dir.join(".git").exists());
+
+                // Walk up from the folder, applying each `.gitignore` relative to the directory
+                // that contains it (matching git), and stop at the git repository root so
+                // `.gitignore` files outside of the repo are not considered.
+                for dir in base.ancestors() {
+                    let gitignore = gitignores.entry(dir.to_path_buf()).or_insert_with(|| {
+                        let path = dir.join(".gitignore");
+
+                        // `Gitignore::new` roots the matcher at the directory
+                        // containing the file, so patterns match relative to it.
+                        path.is_file().then(|| Gitignore::new(&path).0)
+                    });
+
+                    if let Some(gitignore) = gitignore {
+                        if gitignore
+                            .matched_path_or_any_parents(&base, true)
+                            .is_ignore()
+                        {
+                            source = SourceEntry::External { base: base.into() };
+                            break;
+                        }
+                    }
+
+                    // Stop at the git repository root.
+                    if dir.join(".git").exists() {
+                        break;
+                    }
+
+                    // Without a git repository there is no repository root to stop at. Stop
+                    // once the directory contains the current working directory instead, so
+                    // `.gitignore` files outside of the project (e.g. in the user's home
+                    // directory) can never promote a source to an external source. Note that
+                    // the file walker still applies those `.gitignore` files when deciding
+                    // which files to scan.
+                    if !inside_git_repo && cwd.as_ref().is_some_and(|cwd| cwd.starts_with(dir)) {
+                        break;
+                    }
+                }
+            }
+
+            source
+        })
+        .collect::<Vec<SourceEntry>>()
 }
 
 /// Convert a public source entry to a source entry
 impl From<PublicSourceEntry> for SourceEntry {
     fn from(value: PublicSourceEntry) -> Self {
-        let auto = value.pattern.ends_with("**/*")
-            || PathBuf::from(&value.base).join(&value.pattern).is_dir();
+        if value.negated {
+            return SourceEntry::Ignored {
+                base: value.base.into(),
+                pattern: value.pattern,
+            };
+        }
+
+        let auto =
+            value.pattern == "/**/*" || PathBuf::from(&value.base).join(&value.pattern).is_dir();
+
+        if !auto {
+            return SourceEntry::Pattern {
+                base: value.base.into(),
+                pattern: value.pattern,
+            };
+        }
 
         let inside_ignored_content_dir = IGNORED_CONTENT_DIRS.iter().any(|dir| {
             value.base.contains(&format!(
@@ -239,23 +530,15 @@ impl From<PublicSourceEntry> for SourceEntry {
                 std::path::MAIN_SEPARATOR
             )) || value
                 .base
-                .ends_with(&format!("{}{}", std::path::MAIN_SEPARATOR, dir,))
+                .ends_with(&format!("{}{}", std::path::MAIN_SEPARATOR, dir))
         });
 
-        match (value.negated, auto, inside_ignored_content_dir) {
-            (false, true, false) => SourceEntry::Auto {
+        match inside_ignored_content_dir {
+            false => SourceEntry::Auto {
                 base: value.base.into(),
             },
-            (false, true, true) => SourceEntry::External {
+            true => SourceEntry::External {
                 base: value.base.into(),
-            },
-            (false, false, _) => SourceEntry::Pattern {
-                base: value.base.into(),
-                pattern: value.pattern,
-            },
-            (true, _, _) => SourceEntry::Ignored {
-                base: value.base.into(),
-                pattern: value.pattern,
             },
         }
     }

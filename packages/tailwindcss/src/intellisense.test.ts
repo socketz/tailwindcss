@@ -1,35 +1,37 @@
 import { expect, test } from 'vitest'
 import { __unstable__loadDesignSystem } from '.'
-import { buildDesignSystem } from './design-system'
+import { decl, rule } from './ast'
 import plugin from './plugin'
-import { Theme, ThemeOptions } from './theme'
+import { ThemeOptions } from './theme'
 
 const css = String.raw
 
 function loadDesignSystem() {
-  let theme = new Theme()
-  theme.add('--spacing', '0.25rem')
-  theme.add('--colors-red-500', 'red')
-  theme.add('--colors-blue-500', 'blue')
-  theme.add('--breakpoint-sm', '640px')
-  theme.add('--aspect-video', '16 / 9')
-  theme.add('--font-sans', 'sans-serif')
-  theme.add('--font-weight-superbold', '900')
-  theme.add('--text-xs', '0.75rem')
-  theme.add('--text-xs--line-height', '1rem')
-  theme.add('--perspective-dramatic', '100px')
-  theme.add('--perspective-normal', '500px')
-  theme.add('--opacity-background', '0.3')
-  theme.add('--drop-shadow-sm', '0 1px 1px rgb(0 0 0 / 0.05)')
-  theme.add('--inset-shadow-sm', 'inset 0 1px 1px rgb(0 0 0 / 0.05)')
-  theme.add('--font-weight-bold', '700')
-  theme.add('--container-md', '768px')
-  theme.add('--container-lg', '1024px')
-  return buildDesignSystem(theme)
+  return __unstable__loadDesignSystem(`
+    @theme {
+      --spacing: 0.25rem;
+      --colors-red-500: red;
+      --colors-blue-500: blue;
+      --breakpoint-sm: 640px;
+      --aspect-video: 16 / 9;
+      --font-sans: sans-serif;
+      --font-weight-superbold: 900;
+      --text-xs: 0.75rem;
+      --text-xs--line-height: 1rem;
+      --perspective-dramatic: 100px;
+      --perspective-normal: 500px;
+      --opacity-background: 0.3;
+      --drop-shadow-sm: 0 1px 1px rgb(0 0 0 / 0.05);
+      --inset-shadow-sm: inset 0 1px 1px rgb(0 0 0 / 0.05);
+      --font-weight-bold: 700;
+      --container-md: 768px;
+      --container-lg: 1024px;
+    }
+  `)
 }
 
-test('getClassList', () => {
-  let design = loadDesignSystem()
+test('getClassList', async () => {
+  let design = await loadDesignSystem()
   let classList = design.getClassList()
   let classNames = classList.flatMap(([name, meta]) => [
     name,
@@ -39,8 +41,8 @@ test('getClassList', () => {
   expect(classNames).toMatchSnapshot()
 })
 
-test('Spacing utilities do not suggest bare values when not using the multiplier-based spacing scale', () => {
-  let design = loadDesignSystem()
+test('Spacing utilities do not suggest bare values when not using the multiplier-based spacing scale', async () => {
+  let design = await loadDesignSystem()
 
   // Remove spacing scale
   design.theme.clearNamespace('--spacing', ThemeOptions.NONE)
@@ -58,22 +60,22 @@ test('Spacing utilities do not suggest bare values when not using the multiplier
   expect(classNames).not.toContain('p-4')
 })
 
-test('Theme values with underscores are converted back to decimal points', () => {
-  let design = loadDesignSystem()
+test('Theme values with underscores are converted back to decimal points', async () => {
+  let design = await loadDesignSystem()
   let classes = design.getClassList()
 
   expect(classes).toContainEqual(['inset-0.5', { modifiers: [] }])
 })
 
-test('getVariants', () => {
-  let design = loadDesignSystem()
+test('getVariants', async () => {
+  let design = await loadDesignSystem()
   let variants = design.getVariants()
 
   expect(variants).toMatchSnapshot()
 })
 
-test('getVariants compound', () => {
-  let design = loadDesignSystem()
+test('getVariants compound', async () => {
+  let design = await loadDesignSystem()
   let variants = design.getVariants()
   let group = variants.find((v) => v.name === 'group')!
 
@@ -130,16 +132,16 @@ test('variant selectors are in the correct order', async () => {
   `)
 })
 
-test('The variant `has-force` does not crash', () => {
-  let design = loadDesignSystem()
+test('The variant `has-force` does not crash', async () => {
+  let design = await loadDesignSystem()
   let variants = design.getVariants()
   let has = variants.find((v) => v.name === 'has')!
 
   expect(has.selectors({ value: 'force' })).toMatchInlineSnapshot(`[]`)
 })
 
-test('Can produce CSS per candidate using `candidatesToCss`', () => {
-  let design = loadDesignSystem()
+test('Can produce CSS per candidate using `candidatesToCss`', async () => {
+  let design = await loadDesignSystem()
   design.invalidCandidates = new Set(['bg-[#fff]'])
 
   expect(design.candidatesToCss(['underline', 'i-dont-exist', 'bg-[#fff]', 'bg-[#000]', 'text-xs']))
@@ -162,6 +164,26 @@ test('Can produce CSS per candidate using `candidatesToCss`', () => {
       ",
       ]
     `)
+})
+
+test('Can produce AST per candidate using `candidatesToAst`', async () => {
+  let design = await loadDesignSystem()
+  design.invalidCandidates = new Set(['bg-[#fff]'])
+
+  expect(
+    design.candidatesToAst(['underline', 'i-dont-exist', 'bg-[#fff]', 'bg-[#000]', 'text-xs']),
+  ).toEqual([
+    [rule('.underline', [decl('text-decoration-line', 'underline')])],
+    [],
+    [],
+    [rule('.bg-\\[\\#000\\]', [decl('background-color', '#000')])],
+    [
+      rule('.text-xs', [
+        decl('font-size', 'var(--text-xs)'),
+        decl('line-height', 'var(--tw-leading, var(--text-xs--line-height))'),
+      ]),
+    ],
+  ])
 })
 
 test('Utilities do not show wrapping selector in intellisense', async () => {
@@ -237,7 +259,7 @@ test('Utilities, when marked as important, show as important in intellisense', a
 test('Static utilities from plugins are listed in hovers and completions', async () => {
   let input = css`
     @import 'tailwindcss/utilities';
-    @plugin "./plugin.js"l;
+    @plugin "./plugin.js";
   `
 
   let design = await __unstable__loadDesignSystem(input, {
@@ -274,7 +296,7 @@ test('Static utilities from plugins are listed in hovers and completions', async
 test('Functional utilities from plugins are listed in hovers and completions', async () => {
   let input = css`
     @import 'tailwindcss/utilities';
-    @plugin "./plugin.js"l;
+    @plugin "./plugin.js";
   `
 
   let design = await __unstable__loadDesignSystem(input, {
@@ -475,11 +497,6 @@ test('Custom functional @utility', async () => {
     @import 'tailwindcss/utilities';
 
     @theme reference {
-      --tab-size-1: 1;
-      --tab-size-2: 2;
-      --tab-size-4: 4;
-      --tab-size-github: 8;
-
       --text-xs: 0.75rem;
       --text-xs--line-height: calc(1 / 0.75);
 
@@ -488,15 +505,16 @@ test('Custom functional @utility', async () => {
 
       --spacing: 0.25rem;
       --spacing-custom: 123px;
-    }
 
-    @utility tab-* {
-      tab-size: --value(--tab-size, 'revert', 'initial');
+      --negative-1: 1;
+      --negative-2: 2;
+      --negative-4: 4;
+      --negative-a: 8;
     }
 
     @utility example-* {
       font-size: --value(--text);
-      line-height: --value(--text- * --line-height);
+      line-height: --value(--text-* --line-height);
       line-height: --modifier(--leading, 'normal');
     }
 
@@ -513,7 +531,7 @@ test('Custom functional @utility', async () => {
     }
 
     @utility -negative-* {
-      margin: --value(--tab-size- *);
+      margin: --value(--negative-*);
     }
   `
 
@@ -527,18 +545,6 @@ test('Custom functional @utility', async () => {
 
   let classMap = new Map(design.getClassList())
   let classNames = Array.from(classMap.keys())
-
-  expect(classNames).toContain('tab-1')
-  expect(classNames).toContain('tab-2')
-  expect(classNames).toContain('tab-4')
-  expect(classNames).toContain('tab-github')
-  expect(classNames).toContain('tab-revert')
-  expect(classNames).toContain('tab-initial')
-
-  expect(classNames).not.toContain('-tab-1')
-  expect(classNames).not.toContain('-tab-2')
-  expect(classNames).not.toContain('-tab-4')
-  expect(classNames).not.toContain('-tab-github')
 
   expect(classNames).toContain('with-custom-spacing-custom')
   expect(classNames).not.toContain('with-custom-spacing-0')
@@ -561,15 +567,48 @@ test('Custom functional @utility', async () => {
   expect(classNames).toContain('-negative-1')
   expect(classNames).toContain('-negative-2')
   expect(classNames).toContain('-negative-4')
-  expect(classNames).toContain('-negative-github')
+  expect(classNames).toContain('-negative-a')
 
   expect(classNames).not.toContain('--negative-1')
   expect(classNames).not.toContain('--negative-2')
   expect(classNames).not.toContain('--negative-4')
-  expect(classNames).not.toContain('--negative-github')
+  expect(classNames).not.toContain('--negative-a')
 
   expect(classNames).toContain('example-xs')
   expect(classMap.get('example-xs')?.modifiers).toEqual(['normal', 'foo', 'bar'])
+})
+
+test('Custom utilities sharing a root with built-in utilities should merge suggestions', async () => {
+  let input = css`
+    @import 'tailwindcss/utilities';
+    @theme {
+      --font-sans: sans-serif;
+    }
+
+    @theme {
+      --font-weight-custom: 1234;
+      --font-weight-bold: bold; /* Overlap with existing utility */
+    }
+
+    @utility font-* {
+      --my-font-weight: --value(--font-weight-*);
+    }
+  `
+
+  let design = await __unstable__loadDesignSystem(input, {
+    loadStylesheet: async (_, base) => ({
+      path: '',
+      base,
+      content: '@tailwind utilities;',
+    }),
+  })
+
+  let classMap = new Map(design.getClassList())
+  let classNames = Array.from(classMap.keys())
+
+  expect(classNames).toContain('font-sans') // Existing font-family utility
+  expect(classNames).toContain('font-bold') // Existing font-family utility & custom font-weight utility
+  expect(classNames).toContain('font-custom') // Custom font-weight utility
 })
 
 test('Theme keys with underscores are suggested with underscores', async () => {
@@ -580,18 +619,18 @@ test('Theme keys with underscores are suggested with underscores', async () => {
       /* Disable the spacing scale */
       --spacing: initial;
 
-      /* This will get suggeted with a dot because its surrounded by numbers */
+      /* This will get suggested with a dot because its surrounded by numbers */
       --spacing-1_5: 1.5rem;
 
-      /* This will get suggeted with a dot  */
+      /* This will get suggested with a dot  */
       --spacing-2\.5: 1.5rem;
 
-      /* This will get suggeted with an underscore */
+      /* This will get suggested with an underscore */
       --spacing-logo_margin: 0.875rem;
     }
 
     @utility ex-* {
-      width: --value(--spacing- *);
+      width: --value(--spacing-*);
     }
   `
 
@@ -674,4 +713,76 @@ test('Custom @utility and existing utility with names matching theme keys dont g
 
   expect(matches).toHaveLength(1)
   expect(classMap.get('text-header')?.modifiers).toEqual(['sm'])
+})
+
+test('matchVariant', async () => {
+  let input = css`
+    @import 'tailwindcss/utilities';
+    @plugin "./plugin.js";
+  `
+
+  let design = await __unstable__loadDesignSystem(input, {
+    loadStylesheet: async (_, base) => ({
+      path: '',
+      base,
+      content: '@tailwind utilities;',
+    }),
+    loadModule: async () => ({
+      path: '',
+      base: '',
+      module: plugin(({ matchVariant }) => {
+        matchVariant('foo', (val) => `&:is(${val})`, {
+          values: {
+            DEFAULT: '1',
+            a: 'a',
+            b: 'b',
+          },
+        })
+      }),
+    }),
+  })
+
+  let variants = design.getVariants()
+  let v1 = variants.find((v) => v.name === 'foo')!
+  expect(v1).not.toBeUndefined()
+
+  expect(v1.hasDash).toEqual(true)
+  expect(v1.isArbitrary).toEqual(true)
+  expect(v1.name).toEqual('foo')
+  expect(v1.values).toEqual(['a', 'b'])
+})
+
+test('matchUtilities discards internal only helpers from suggestions when using the theme function', async () => {
+  let input = css`
+    @import 'tailwindcss/utilities';
+    @plugin "./plugin.js";
+
+    @theme {
+      --color-red: red;
+    }
+  `
+
+  let design = await __unstable__loadDesignSystem(input, {
+    loadStylesheet: async (_, base) => ({
+      path: '',
+      base,
+      content: '@tailwind utilities;',
+    }),
+    loadModule: async () => ({
+      path: '',
+      base: '',
+      module: plugin(({ matchUtilities, theme }) => {
+        matchUtilities({ foo: (val) => ({ color: val }) }, { values: theme('colors') })
+        matchUtilities({ bar: (val) => ({ color: val }) }, { values: theme('transitionDuration') })
+      }),
+    }),
+  })
+
+  let classNames = design.getClassList().map((e) => e[0])
+
+  expect(classNames).not.toContain('foo-__BARE_VALUE__')
+  expect(classNames).not.toContain('bar-__BARE_VALUE__')
+
+  expect(classNames).not.toContain('foo-__CSS_VALUES__')
+  expect(classNames).not.toContain('bar-__CSS_VALUES__')
 })

@@ -8,6 +8,12 @@ describe.each(['Unix', 'Windows'])('Line endings: %s', (lineEndings) => {
     return CSS.parse(string.replaceAll(/\r?\n/g, lineEndings === 'Windows' ? '\r\n' : '\n'))
   }
 
+  function parseWithLoc(string: string) {
+    return CSS.parse(string.replaceAll(/\r?\n/g, lineEndings === 'Windows' ? '\r\n' : '\n'), {
+      from: 'input.css',
+    })
+  }
+
   describe('comments', () => {
     it('should parse a comment and ignore it', () => {
       expect(
@@ -206,7 +212,7 @@ describe.each(['Unix', 'Windows'])('Line endings: %s', (lineEndings) => {
         {
           kind: 'declaration',
           property: 'content',
-          value: `'These are not the end \"\\' of the string'`,
+          value: `'These are not the end "\\' of the string'`,
           important: false,
         },
       ])
@@ -723,6 +729,26 @@ describe.each(['Unix', 'Windows'])('Line endings: %s', (lineEndings) => {
       ).toEqual([{ kind: 'at-rule', name: '@charset', params: '"UTF-8"', nodes: [] }])
     })
 
+    it.each([
+      [' '], // space
+      ['  '], // multiple spaces
+      ['\t'], // tab
+      [' \t'], // space + tab
+      ['\t '], // tab + space
+      ['\t\t'], // multiple tabs
+      ['\n'], // newline
+      [' \n'], // space + newline
+      ['\n '], // newline + space
+      ['\n\n'], // multiple newlines
+      ['\r\n'], // windows newline
+      [' \r\n'], // space + windows newline
+      ['\r\n '], // windows newline + space
+    ])('should parse an at-rule with whitespace %s in the params', (whitespace) => {
+      expect(parse(`@apply${whitespace}bg-red-500;`)).toEqual([
+        { kind: 'at-rule', name: '@apply', params: 'bg-red-500', nodes: [] },
+      ])
+    })
+
     it('should parse an at-rule without a block or semicolon', () => {
       expect(
         parse(`
@@ -1125,7 +1151,20 @@ describe.each(['Unix', 'Windows'])('Line endings: %s', (lineEndings) => {
             color: blue;
           }
         `),
-      ).toThrowErrorMatchingInlineSnapshot(`[Error: Missing opening {]`)
+      ).toThrowErrorMatchingInlineSnapshot(`[CssSyntaxError: Missing opening {]`)
+
+      expect(() =>
+        parseWithLoc(`
+          .foo {
+            color: red;
+          }
+
+          .bar
+            /* ^ Missing opening { */
+            color: blue;
+          }
+        `),
+      ).toThrowErrorMatchingInlineSnapshot(`[CssSyntaxError: input.css:9:11: Missing opening {]`)
     })
 
     it('should error when curly brackets are unbalanced (closing)', () => {
@@ -1140,59 +1179,105 @@ describe.each(['Unix', 'Windows'])('Line endings: %s', (lineEndings) => {
 
        /* ^ Missing closing } */
         `),
-      ).toThrowErrorMatchingInlineSnapshot(`[Error: Missing closing } at .bar]`)
+      ).toThrowErrorMatchingInlineSnapshot(`[CssSyntaxError: Missing closing } at .bar]`)
+
+      expect(() =>
+        parseWithLoc(`
+          .foo {
+            color: red;
+          }
+
+          .bar {
+            color: blue;
+
+       /* ^ Missing closing } */
+        `),
+      ).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:6:11: Missing closing } at .bar]`,
+      )
     })
 
     it('should error when an unterminated string is used', () => {
-      expect(() =>
-        parse(css`
-          .foo {
-            content: "Hello world!
-            /*                    ^ missing " */
-            font-weight: bold;
-          }
-        `),
-      ).toThrowErrorMatchingInlineSnapshot(`[Error: Unterminated string: "Hello world!"]`)
+      let input = css`
+        .foo {
+          content: "Hello world!
+          /*                    ^ missing " */
+          font-weight: bold;
+        }
+      `
+
+      expect(() => parse(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: Unterminated string: "Hello world!"]`,
+      )
+
+      expect(() => parseWithLoc(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:3:20: Unterminated string: "Hello world!"]`,
+      )
     })
 
     it('should error when an unterminated string is used with a `;`', () => {
-      expect(() =>
-        parse(css`
-          .foo {
-            content: "Hello world!;
-            /*                    ^ missing " */
-            font-weight: bold;
-          }
-        `),
-      ).toThrowErrorMatchingInlineSnapshot(`[Error: Unterminated string: "Hello world!;"]`)
+      let input = css`
+        .foo {
+          content: "Hello world!;
+          /*                    ^ missing " */
+          font-weight: bold;
+        }
+      `
+
+      expect(() => parse(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: Unterminated string: "Hello world!;"]`,
+      )
+
+      expect(() => parseWithLoc(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:3:20: Unterminated string: "Hello world!;"]`,
+      )
     })
 
     it('should error when incomplete custom properties are used', () => {
       expect(() => parse('--foo')).toThrowErrorMatchingInlineSnapshot(
-        `[Error: Invalid custom property, expected a value]`,
+        `[CssSyntaxError: Invalid custom property, expected a value]`,
+      )
+
+      expect(() => parseWithLoc('--foo')).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:1:1: Invalid custom property, expected a value]`,
       )
     })
 
     it('should error when incomplete custom properties are used inside rules', () => {
       expect(() => parse('.foo { --bar }')).toThrowErrorMatchingInlineSnapshot(
-        `[Error: Invalid custom property, expected a value]`,
+        `[CssSyntaxError: Invalid custom property, expected a value]`,
+      )
+
+      expect(() => parseWithLoc('.foo { --bar }')).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:1:8: Invalid custom property, expected a value]`,
       )
     })
 
     it('should error when an unterminated string is used in a custom property', () => {
-      expect(() =>
-        parse(css`
-          .foo {
-            --bar: "Hello world!
-            /*                  ^ missing " */
-          }
-        `),
-      ).toThrowErrorMatchingInlineSnapshot(`[Error: Unterminated string: "Hello world!"]`)
+      // prettier-ignore
+      let input = css`
+        .foo {
+          --bar: 'Hello world!
+          /*                  ^ missing ' * /;
+        }
+      `
+
+      expect(() => parse(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: Unterminated string: 'Hello world!']`,
+      )
+
+      expect(() => parseWithLoc(input)).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:3:18: Unterminated string: 'Hello world!']`,
+      )
     })
 
     it('should error when a declaration is incomplete', () => {
       expect(() => parse('.foo { bar }')).toThrowErrorMatchingInlineSnapshot(
-        `[Error: Invalid declaration: \`bar\`]`,
+        `[CssSyntaxError: Invalid declaration: \`bar\`]`,
+      )
+
+      expect(() => parseWithLoc('.foo { bar }')).toThrowErrorMatchingInlineSnapshot(
+        `[CssSyntaxError: input.css:1:8: Invalid declaration: \`bar\`]`,
       )
     })
   })

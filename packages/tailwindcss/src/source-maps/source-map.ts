@@ -1,5 +1,6 @@
-import { walk, type AstNode } from '../ast'
+import { type AstNode } from '../ast'
 import { DefaultMap } from '../utils/default-map'
+import { walk } from '../walk'
 import { createLineTable, type LineTable, type Position } from './line-table'
 import type { Source } from './source'
 
@@ -90,7 +91,7 @@ export function createSourceMap({ ast }: { ast: AstNode[] }) {
   }
 
   // Get all the indexes from the mappings
-  walk(ast, (node: AstNode) => {
+  walk(ast, (node) => {
     if (!node.src || !node.dst) return
 
     let originalSource = sourceTable.get(node.src[0])

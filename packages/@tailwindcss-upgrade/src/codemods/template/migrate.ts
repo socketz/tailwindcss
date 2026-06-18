@@ -1,32 +1,28 @@
 import fs from 'node:fs/promises'
 import path, { extname } from 'node:path'
+import {
+  createSignatureOptions,
+  prepareDesignSystemStorage,
+  UTILITY_SIGNATURE_KEY,
+} from '../../../../tailwindcss/src/canonicalize-candidates'
 import type { Config } from '../../../../tailwindcss/src/compat/plugin-api'
 import type { DesignSystem } from '../../../../tailwindcss/src/design-system'
 import { DefaultMap } from '../../../../tailwindcss/src/utils/default-map'
 import { spliceChangesIntoString, type StringChange } from '../../utils/splice-changes-into-string'
+import { writeFileSafely } from '../../utils/write-file-safely'
 import { extractRawCandidates } from './candidates'
 import { isSafeMigration } from './is-safe-migration'
-import { migrateArbitraryUtilities } from './migrate-arbitrary-utilities'
-import { migrateArbitraryValueToBareValue } from './migrate-arbitrary-value-to-bare-value'
-import { migrateArbitraryVariants } from './migrate-arbitrary-variants'
 import { migrateAutomaticVarInjection } from './migrate-automatic-var-injection'
-import { migrateBareValueUtilities } from './migrate-bare-utilities'
-import { migrateBgGradient } from './migrate-bg-gradient'
 import { migrateCamelcaseInNamedValue } from './migrate-camelcase-in-named-value'
 import { migrateCanonicalizeCandidate } from './migrate-canonicalize-candidate'
-import { migrateDeprecatedUtilities } from './migrate-deprecated-utilities'
-import { migrateDropUnnecessaryDataTypes } from './migrate-drop-unnecessary-data-types'
 import { migrateEmptyArbitraryValues } from './migrate-handle-empty-arbitrary-values'
 import { migrateLegacyArbitraryValues } from './migrate-legacy-arbitrary-values'
 import { migrateLegacyClasses } from './migrate-legacy-classes'
 import { migrateMaxWidthScreen } from './migrate-max-width-screen'
 import { migrateModernizeArbitraryValues } from './migrate-modernize-arbitrary-values'
-import { migrateOptimizeModifier } from './migrate-optimize-modifier'
 import { migratePrefix } from './migrate-prefix'
 import { migrateSimpleLegacyClasses } from './migrate-simple-legacy-classes'
-import { migrateThemeToVar } from './migrate-theme-to-var'
 import { migrateVariantOrder } from './migrate-variant-order'
-import { computeUtilitySignature } from './signatures'
 
 export type Migration = (
   designSystem: DesignSystem,
@@ -38,30 +34,21 @@ export const DEFAULT_MIGRATIONS: Migration[] = [
   migrateEmptyArbitraryValues,
   migratePrefix,
   migrateCanonicalizeCandidate,
-  migrateBgGradient,
   migrateSimpleLegacyClasses,
   migrateCamelcaseInNamedValue,
   migrateLegacyClasses,
   migrateMaxWidthScreen,
-  migrateThemeToVar,
   migrateVariantOrder, // Has to happen before migrations that modify variants
   migrateAutomaticVarInjection,
   migrateLegacyArbitraryValues,
-  migrateArbitraryUtilities,
-  migrateBareValueUtilities,
-  migrateDeprecatedUtilities,
   migrateModernizeArbitraryValues,
-  migrateArbitraryVariants,
-  migrateDropUnnecessaryDataTypes,
-  migrateArbitraryValueToBareValue,
-  migrateOptimizeModifier,
 ]
 
-let migrateCached = new DefaultMap<
-  DesignSystem,
-  DefaultMap<Config | null, DefaultMap<string, Promise<string>>>
->((designSystem) => {
-  return new DefaultMap((userConfig) => {
+let migrateCached = new DefaultMap((baseDesignSystem: DesignSystem) => {
+  let designSystem = prepareDesignSystemStorage(baseDesignSystem)
+  let options = createSignatureOptions(designSystem)
+
+  return new DefaultMap((userConfig: Config | null) => {
     return new DefaultMap(async (rawCandidate) => {
       let original = rawCandidate
 
@@ -69,10 +56,13 @@ let migrateCached = new DefaultMap<
         rawCandidate = await migration(designSystem, userConfig, rawCandidate)
       }
 
+      // Canonicalize the final migrated candidate to its final form
+      rawCandidate = designSystem.canonicalizeCandidates([rawCandidate]).pop()!
+
       // Verify that the candidate actually makes sense at all. E.g.: `duration`
       // is not a valid candidate, but it will parse because `duration-<number>`
       // exists.
-      let signature = computeUtilitySignature.get(designSystem).get(rawCandidate)
+      let signature = designSystem.storage[UTILITY_SIGNATURE_KEY].get(options).get(rawCandidate)
       if (typeof signature !== 'string') return original
 
       return rawCandidate
@@ -130,12 +120,18 @@ export default async function migrateContents(
   return spliceChangesIntoString(contents, changes)
 }
 
-export async function migrate(designSystem: DesignSystem, userConfig: Config | null, file: string) {
+export async function migrate(
+  designSystem: DesignSystem,
+  userConfig: Config | null,
+  file: string,
+): Promise<boolean> {
   let fullPath = path.isAbsolute(file) ? file : path.resolve(process.cwd(), file)
   let contents = await fs.readFile(fullPath, 'utf-8')
 
-  await fs.writeFile(
-    fullPath,
-    await migrateContents(designSystem, userConfig, contents, extname(file)),
-  )
+  let migrated = await migrateContents(designSystem, userConfig, contents, extname(file))
+  if (migrated === contents) return false // Nothing changed
+  if (migrated.trim() === '') return false // Emptied out, something went horribly wrong
+
+  await writeFileSafely(fullPath, migrated)
+  return true
 }

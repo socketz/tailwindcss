@@ -1,13 +1,4 @@
-import {
-  atRule,
-  decl,
-  rule,
-  walk,
-  WalkAction,
-  type AstNode,
-  type Rule,
-  type StyleRule,
-} from './ast'
+import { atRule, decl, rule, type AstNode, type Rule, type StyleRule } from './ast'
 import { type Candidate, type Variant } from './candidate'
 import { CompileAstFlags, type DesignSystem } from './design-system'
 import GLOBAL_PROPERTY_ORDER from './property-order'
@@ -15,6 +6,7 @@ import { asColor, type Utility } from './utilities'
 import { compare } from './utils/compare'
 import { escape } from './utils/escape'
 import type { Variants } from './variants'
+import { walk, WalkAction } from './walk'
 
 export function compileCandidates(
   rawCandidates: Iterable<string>,
@@ -295,7 +287,19 @@ function compileBaseUtility(candidate: Candidate, designSystem: DesignSystem) {
 
     let compiledNodes = utility.compileFn(candidate)
     if (compiledNodes === undefined) continue
-    if (compiledNodes === null) return asts
+    if (compiledNodes === null) {
+      // `null` means that the result is invalid and that this plugin should not
+      // result in any CSS, but that doesn't mean that subsequent plugins are
+      // invalid as well.
+      //
+      // However, for backwards compatibility with `matchUtilities` this means
+      // that we do need to bail entirely: plugins that handle a specific
+      // arbitrary value type prevent falling through to other plugins if the
+      // result is invalid for that plugin
+      if (utility.options?.types?.length) return asts
+
+      continue
+    }
     asts.push(compiledNodes)
   }
 
@@ -307,7 +311,19 @@ function compileBaseUtility(candidate: Candidate, designSystem: DesignSystem) {
 
     let compiledNodes = utility.compileFn(candidate)
     if (compiledNodes === undefined) continue
-    if (compiledNodes === null) return asts
+    if (compiledNodes === null) {
+      // `null` means that the result is invalid and that this plugin should not
+      // result in any CSS, but that doesn't mean that subsequent plugins are
+      // invalid as well.
+      //
+      // However, for backwards compatibility with `matchUtilities` this means
+      // that we do need to bail entirely: plugins that handle a specific
+      // arbitrary value type prevent falling through to other plugins if the
+      // result is invalid for that plugin
+      if (utility.options?.types?.length) return asts
+
+      continue
+    }
     asts.push(compiledNodes)
   }
 

@@ -1,5 +1,5 @@
 import { Polyfills } from '.'
-import { optimizeAst, toCss } from './ast'
+import { optimizeAst, toCss, type AstNode } from './ast'
 import {
   parseCandidate,
   parseVariant,
@@ -10,13 +10,22 @@ import {
 } from './candidate'
 import { compileAstNodes, compileCandidates } from './compile'
 import { substituteFunctions } from './css-functions'
-import { getClassList, getVariants, type ClassEntry, type VariantEntry } from './intellisense'
+import {
+  canonicalizeCandidates,
+  getClassList,
+  getVariants,
+  type CanonicalizeOptions,
+  type ClassEntry,
+  type VariantEntry,
+} from './intellisense'
 import { getClassOrder } from './sort'
+import type { SourceLocation } from './source-maps/source'
 import { Theme, ThemeOptions, type ThemeKey } from './theme'
 import { Utilities, createUtilities, withAlpha } from './utilities'
 import { DefaultMap } from './utils/default-map'
 import { extractUsedVariables } from './utils/variables'
-import { Variants, createVariants } from './variants'
+import { Variants, createVariants, substituteAtVariant } from './variants'
+import { WalkAction, walk } from './walk'
 
 export const enum CompileAstFlags {
   None = 0,
@@ -48,12 +57,20 @@ export type DesignSystem = {
   resolveThemeValue(path: string, forceInline?: boolean): string | undefined
 
   trackUsedVariables(raw: string): void
+  canonicalizeCandidates(candidates: string[], options?: CanonicalizeOptions): string[]
 
   // Used by IntelliSense
   candidatesToCss(classes: string[]): (string | null)[]
+  candidatesToAst(classes: string[]): AstNode[][]
+
+  // General purpose storage
+  storage: Record<symbol, unknown>
 }
 
-export function buildDesignSystem(theme: Theme): DesignSystem {
+export function buildDesignSystem(
+  theme: Theme,
+  utilitiesSrc?: SourceLocation | undefined,
+): DesignSystem {
   let utilities = createUtilities(theme)
   let variants = createVariants(theme)
 
@@ -66,15 +83,17 @@ export function buildDesignSystem(theme: Theme): DesignSystem {
     return new DefaultMap<Candidate>((candidate) => {
       let ast = compileAstNodes(candidate, designSystem, flags)
 
-      // Arbitrary values (`text-[theme(--color-red-500)]`) and arbitrary
-      // properties (`[--my-var:theme(--color-red-500)]`) can contain function
-      // calls so we need evaluate any functions we find there that weren't in
-      // the source CSS.
       try {
-        substituteFunctions(
-          ast.map(({ node }) => node),
-          designSystem,
-        )
+        let nodes = ast.map((value) => value.node)
+
+        // Arbitrary values (`text-[theme(--color-red-500)]`) and arbitrary
+        // properties (`[--my-var:theme(--color-red-500)]`) can contain function
+        // calls so we need evaluate any functions we find there that weren't in
+        // the source CSS.
+        substituteFunctions(nodes, designSystem)
+
+        // JS plugins might contain an `@variant` inside a generated utility
+        substituteAtVariant(nodes, designSystem)
       } catch (err) {
         // If substitution fails then the candidate likely contains a call to
         // `theme()` that is invalid which may be because of incorrect usage,
@@ -92,6 +111,44 @@ export function buildDesignSystem(theme: Theme): DesignSystem {
     }
   })
 
+  function candidatesToAst(classes: string[]): AstNode[][] {
+    let result: AstNode[][] = []
+
+    for (let className of classes) {
+      let wasValid = true
+
+      let { astNodes } = compileCandidates([className], designSystem, {
+        onInvalidCandidate() {
+          wasValid = false
+        },
+      })
+
+      if (utilitiesSrc) {
+        walk(astNodes, (node) => {
+          // We do this conditionally to preserve source locations from both
+          // `@utility` and `@custom-variant`. Even though generated nodes are
+          // cached this should be fine because `utilitiesNode.src` should not
+          // change without a full rebuild which destroys the cache.
+          node.src ??= utilitiesSrc
+          return WalkAction.Continue
+        })
+      }
+
+      // Disable all polyfills to not unnecessarily pollute IntelliSense output
+      astNodes = optimizeAst(astNodes, designSystem, Polyfills.None)
+
+      result.push(wasValid ? astNodes : [])
+    }
+
+    return result
+  }
+
+  function candidatesToCss(classes: string[]): (string | null)[] {
+    return candidatesToAst(classes).map((nodes) => {
+      return nodes.length > 0 ? toCss(nodes) : null
+    })
+  }
+
   let designSystem: DesignSystem = {
     theme,
     utilities,
@@ -100,30 +157,8 @@ export function buildDesignSystem(theme: Theme): DesignSystem {
     invalidCandidates: new Set(),
     important: false,
 
-    candidatesToCss(classes: string[]) {
-      let result: (string | null)[] = []
-
-      for (let className of classes) {
-        let wasInvalid = false
-
-        let { astNodes } = compileCandidates([className], this, {
-          onInvalidCandidate() {
-            wasInvalid = true
-          },
-        })
-
-        // Disable all polyfills to not unnecessarily pollute IntelliSense output
-        astNodes = optimizeAst(astNodes, designSystem, Polyfills.None)
-
-        if (astNodes.length === 0 || wasInvalid) {
-          result.push(null)
-        } else {
-          result.push(toCss(astNodes))
-        }
-      }
-
-      return result
-    },
+    candidatesToCss,
+    candidatesToAst,
 
     getClassOrder(classes) {
       return getClassOrder(this, classes)
@@ -202,6 +237,14 @@ export function buildDesignSystem(theme: Theme): DesignSystem {
     trackUsedVariables(raw: string) {
       trackUsedVariables.get(raw)
     },
+
+    canonicalizeCandidates(candidates: string[], options?: CanonicalizeOptions) {
+      return canonicalizeCandidates(this, candidates, options)
+    },
+
+    // General purpose storage, each key has to be a unique symbol to avoid
+    // collisions.
+    storage: {},
   }
 
   return designSystem

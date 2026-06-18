@@ -1,8 +1,11 @@
 import dedent from 'dedent'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe } from 'vitest'
-import { candidate, css, html, js, json, test, ts, yaml } from '../utils'
+import { candidate, css, html, js, json, retryAssertion, test, ts, txt, yaml } from '../utils'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const STANDALONE_BINARY = (() => {
   switch (os.platform()) {
@@ -373,6 +376,86 @@ describe.each([
   )
 
   test(
+    "watch mode with unknown @source paths shouldn't crash on Windows",
+    {
+      fs: {
+        'package.json': json`
+          {
+            "dependencies": {
+              "tailwindcss": "workspace:^",
+              "@tailwindcss/cli": "workspace:^"
+            }
+          }
+        `,
+        'index.html': html`
+          <div class="underline"></div>
+        `,
+        'src/index.css': css`
+          @import 'tailwindcss';
+          @source "unknown-folder/**/*";
+        `,
+      },
+    },
+    async ({ fs, spawn }) => {
+      let process = await spawn(`${command} --input src/index.css --output dist/out.css --watch`)
+      await process.onStderr((m) => m.includes('Done in'))
+
+      await fs.expectFileToContain('dist/out.css', [candidate`underline`])
+    },
+  )
+
+  // https://github.com/tailwindlabs/tailwindcss/issues/17632
+  test(
+    'watch mode rebuilds when the input file is in an ignored folder',
+    {
+      fs: {
+        'package.json': json`
+          {
+            "dependencies": {
+              "tailwindcss": "workspace:^",
+              "@tailwindcss/cli": "workspace:^"
+            }
+          }
+        `,
+        'assets/tailwind.config.js': js`
+          module.exports = {
+            content: {
+              relative: true,
+              files: ['html/*.html'],
+            },
+          }
+        `,
+        'assets/html/index.html': html`
+          <div class="underline"></div>
+        `,
+        'assets/css/index.css': css`
+          @import 'tailwindcss' source(none);
+          @config '../tailwind.config.js';
+        `,
+      },
+    },
+    async ({ fs, spawn }) => {
+      let process = await spawn(
+        `${command} --input assets/css/index.css --output dist/out.css --watch`,
+      )
+      await process.onStderr((m) => m.includes('Done in'))
+
+      await fs.expectFileToContain('dist/out.css', [candidate`underline`])
+
+      await fs.write(
+        'assets/css/index.css',
+        css`
+          @import 'tailwindcss' source(none);
+          @config '../tailwind.config.js';
+          @source inline("flex");
+        `,
+      )
+
+      await fs.expectFileToContain('dist/out.css', [candidate`flex`])
+    },
+  )
+
+  test(
     'production build (stdin)',
     {
       fs: {
@@ -641,7 +724,7 @@ describe.each([
             }
           }
         `,
-        'ssrc/index.html': html`
+        'src/index.html': html`
           <div class="flex"></div>
         `,
         'src/index.css': css`
@@ -702,7 +785,7 @@ describe.each([
             }
           }
         `,
-        'ssrc/index.html': html`
+        'src/index.html': html`
           <div class="flex"></div>
         `,
         'src/index.css': css`
@@ -749,7 +832,7 @@ describe.each([
       expect(map.at(4, 0)).toMatchObject({
         source: null,
         original: '(none)',
-        generated: '}...',
+        generated: '}\n\n/*# sou...',
       })
     },
   )
@@ -768,7 +851,7 @@ describe.each([
             }
           }
         `,
-        'ssrc/index.html': html`
+        'src/index.html': html`
           <div class="flex"></div>
         `,
         'src/index.css': css`
@@ -812,8 +895,563 @@ describe.each([
       expect(map.at(4, 0)).toMatchObject({
         source: null,
         original: '(none)',
+        generated: '}\n\n/*# sou...',
+      })
+    },
+  )
+
+  test(
+    'watch mode + inline source maps',
+    {
+      fs: {
+        'package.json': json`
+          {
+            "dependencies": {
+              "tailwindcss": "workspace:^",
+              "@tailwindcss/cli": "workspace:^"
+            }
+          }
+        `,
+        'src/index.html': html`
+          <div class="flex"></div>
+        `,
+        'src/index.css': css`
+          @import 'tailwindcss/utilities';
+          /*  */
+        `,
+      },
+    },
+    async ({ spawn, expect, fs, parseSourceMap }) => {
+      let process = await spawn(
+        `${command} --input src/index.css --output dist/out.css --map --watch`,
+      )
+      await process.onStderr((m) => m.includes('Done in'))
+
+      await fs.expectFileToContain('dist/out.css', [candidate`flex`])
+
+      let originalCss = await fs.read('dist/out.css')
+      let currentCss = originalCss
+
+      // Make sure we can find a source map
+      let map = parseSourceMap(currentCss)
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
         generated: '}...',
       })
+
+      // Write to project source files
+      await fs.write('src/index.html', html`
+        <div class="flex underline"></div>
+      `)
+
+      // Wait for the CSS to be rebuilt
+      await retryAssertion(async () => {
+        currentCss = await fs.read('dist/out.css')
+        expect(currentCss).not.toEqual(originalCss)
+        originalCss = currentCss
+      })
+
+      // Make sure the source map was updated
+      map = parseSourceMap(currentCss)
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.underli...',
+      })
+
+      expect(map.at(5, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.underline...',
+      })
+
+      expect(map.at(6, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'text-decor...',
+      })
+
+      expect(map.at(7, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}...',
+      })
+
+      // Write to the main CSS file
+      await fs.write(
+        'src/index.css',
+        css`
+          @import 'tailwindcss/utilities';
+          @source inline("w-auto");
+        `,
+      )
+
+      // Wait for the CSS to be rebuilt
+      await retryAssertion(async () => {
+        currentCss = await fs.read('dist/out.css')
+        expect(currentCss).not.toEqual(originalCss)
+        originalCss = currentCss
+      })
+
+      // Make sure the source map was updated
+      map = parseSourceMap(currentCss)
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.w-auto...',
+      })
+
+      expect(map.at(5, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.w-auto {...',
+      })
+
+      expect(map.at(6, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'width: aut...',
+      })
+
+      expect(map.at(7, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.underli...',
+      })
+
+      expect(map.at(8, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.underline...',
+      })
+
+      expect(map.at(9, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'text-decor...',
+      })
+
+      expect(map.at(10, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}...',
+      })
+    },
+  )
+
+  test(
+    'watch mode + separate source maps',
+    {
+      fs: {
+        'package.json': json`
+          {
+            "dependencies": {
+              "tailwindcss": "workspace:^",
+              "@tailwindcss/cli": "workspace:^"
+            }
+          }
+        `,
+        'src/index.html': html`
+          <div class="flex"></div>
+        `,
+        'src/index.css': css`
+          @import 'tailwindcss/utilities';
+          /*  */
+        `,
+      },
+    },
+    async ({ spawn, expect, fs, parseSourceMap }) => {
+      let process = await spawn(
+        `${command} --input src/index.css --output dist/out.css --map dist/out.css.map --watch`,
+      )
+      await process.onStderr((m) => m.includes('Done in'))
+
+      await fs.expectFileToContain('dist/out.css', [candidate`flex`])
+
+      // Make sure we can find a source map
+      let originalCss = await fs.read('dist/out.css')
+      let originalMap = await fs.read('dist/out.css.map')
+      let currentCss = originalCss
+      let currentMap = originalMap
+
+      // Make sure we can find a source map
+      let map = parseSourceMap({ map: currentMap, content: currentCss })
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n\n/*# sou...',
+      })
+
+      // Write to project source files
+      await fs.write('src/index.html', html`
+        <div class="flex underline"></div>
+      `)
+
+      // Wait for the CSS to be rebuilt
+      await retryAssertion(async () => {
+        currentCss = await fs.read('dist/out.css')
+        currentMap = await fs.read('dist/out.css.map')
+        expect(currentCss).not.toEqual(originalCss)
+        expect(currentMap).not.toEqual(originalMap)
+        originalCss = currentCss
+        originalMap = currentMap
+      })
+
+      // Make sure the source map was updated
+      map = parseSourceMap({ map: currentMap, content: currentCss })
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.underli...',
+      })
+
+      expect(map.at(5, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.underline...',
+      })
+
+      expect(map.at(6, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'text-decor...',
+      })
+
+      expect(map.at(7, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n\n/*# sou...',
+      })
+
+      // Write to the main CSS file
+      await fs.write(
+        'src/index.css',
+        css`
+          @import 'tailwindcss/utilities';
+          @source inline("w-auto");
+        `,
+      )
+
+      // Wait for the CSS to be rebuilt
+      await retryAssertion(async () => {
+        currentCss = await fs.read('dist/out.css')
+        currentMap = await fs.read('dist/out.css.map')
+        expect(currentCss).not.toEqual(originalCss)
+        expect(currentMap).not.toEqual(originalMap)
+        originalCss = currentCss
+        originalMap = currentMap
+      })
+
+      // Make sure the source map was updated
+      map = parseSourceMap({ map: currentMap, content: currentCss })
+
+      expect(map.at(1, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '/*! tailwi...',
+      })
+
+      expect(map.at(2, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.flex {...',
+      })
+
+      expect(map.at(3, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'display: f...',
+      })
+
+      expect(map.at(4, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.w-auto...',
+      })
+
+      expect(map.at(5, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.w-auto {...',
+      })
+
+      expect(map.at(6, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'width: aut...',
+      })
+
+      expect(map.at(7, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n.underli...',
+      })
+
+      expect(map.at(8, 0)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: '.underline...',
+      })
+
+      expect(map.at(9, 2)).toMatchObject({
+        source:
+          kind === 'CLI'
+            ? expect.stringContaining('utilities.css')
+            : expect.stringMatching(/\/utilities-\w+\.css$/),
+        original: '@tailwind...',
+        generated: 'text-decor...',
+      })
+
+      expect(map.at(10, 0)).toMatchObject({
+        source: null,
+        original: '(none)',
+        generated: '}\n\n/*# sou...',
+      })
+    },
+  )
+
+  test(
+    'watch mode should trigger a full rebuild when a dependency is removed',
+    {
+      fs: {
+        'package.json': json`
+          {
+            "dependencies": {
+              "tailwindcss": "workspace:^",
+              "@tailwindcss/cli": "workspace:^"
+            }
+          }
+        `,
+        'src/index.html': html`
+          <div class="flex text-primary"></div>
+        `,
+        'src/index.css': css`
+          @import 'tailwindcss/utilities';
+          @config '../tailwind.config.js';
+        `,
+        'tailwind.config.js': js`
+          const myColor = require('./my-color')
+
+          module.exports = {
+            theme: {
+              extend: {
+                colors: {
+                  primary: myColor,
+                },
+              },
+            },
+          }
+        `,
+        'my-color.js': js`
+          //
+          module.exports = 'blue'
+        `,
+      },
+    },
+    async ({ spawn, fs, expect }) => {
+      let process = await spawn(`${command} --input src/index.css --output dist/out.css --watch`)
+      await process.onStderr((m) => m.includes('Done in'))
+
+      expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
+        "
+        --- dist/out.css ---
+        .flex {
+          display: flex;
+        }
+        .text-primary {
+          color: blue;
+        }
+        "
+      `)
+
+      // Remove the dependency of the tailwind.config.js file
+      await fs.delete('my-color.js')
+
+      // We expect an error
+      await process.onStderr((m) => m.includes('Error'))
+      await process.onStderr((m) => m.includes('Done in'))
+
+      // Re-create the file to resolve the issue
+      await fs.write('my-color.js', js`module.exports = 'red'`)
+      await process.onStderr((m) => m.includes('Done in'))
+
+      // Expect a full rebuild
+      expect(await fs.dumpFiles('dist/*.css')).toMatchInlineSnapshot(`
+        "
+        --- dist/out.css ---
+        .flex {
+          display: flex;
+        }
+        .text-primary {
+          color: red;
+        }
+        "
+      `)
     },
   )
 })
@@ -1333,6 +1971,330 @@ test(
 )
 
 test(
+  'source(…) and `@source` are relative to the file they are in',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'index.css': css` @import './project-a/src/index.css'; `,
+
+      'project-a/src/index.css': css`
+        /* Run auto-content detection in ../../project-b */
+        @import 'tailwindcss/utilities' source('../../project-b');
+
+        /* Explicitly using node_modules in the @source allows git ignored folders */
+        @source '../../project-c';
+      `,
+
+      // Project A is the current folder, but we explicitly configured
+      // `source(project-b)`, therefore project-a should not be included in
+      // the output.
+      'project-a/src/index.html': html`
+        <div
+          class="content-['SHOULD-NOT-EXIST-IN-OUTPUT'] content-['project-a/src/index.html']"
+        ></div>
+      `,
+
+      // Project B is the configured `source(…)`, therefore auto source
+      // detection should include known extensions and folders in the output.
+      'project-b/src/index.html': html`
+        <div
+          class="content-['project-b/src/index.html']"
+        ></div>
+      `,
+
+      // Project C should apply auto source detection, therefore known
+      // extensions and folders should be included in the output.
+      'project-c/src/index.html': html`
+        <div
+          class="content-['project-c/src/index.html']"
+        ></div>
+      `,
+    },
+  },
+  async ({ fs, exec, root, expect }) => {
+    await exec('pnpm tailwindcss --input ./index.css --output dist/out.css', { cwd: root })
+
+    let content = await fs.dumpFiles('./dist/*.css')
+
+    expect(content).not.toContain(candidate`content-['project-a/src/index.html']`)
+    expect(content).toContain(candidate`content-['project-b/src/index.html']`)
+    expect(content).toContain(candidate`content-['project-c/src/index.html']`)
+  },
+)
+
+test(
+  '@source order is important (referencing sibling project)',
+  {
+    fs: {
+      'package.json': json`{}`,
+      'pnpm-workspace.yaml': yaml`
+        #
+        packages:
+          - project-a
+      `,
+      'project-a/package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'project-a/src/index.css': css`
+        @import 'tailwindcss/utilities' source(none);
+
+        @source '../../project-b';
+        @source not '../../project-b/ignored';
+        @source '../../project-b/ignored/except.html';
+      `,
+
+      'project-b/keep/keep.html': html`<div class="content-['GOOD-1']"></div>`,
+      'project-b/ignored/ignored.html': html`<div class="content-['BAD-1']"></div>`,
+      'project-b/ignored/except.html': html`<div class="content-['GOOD-2']"></div>`,
+    },
+  },
+  async ({ fs, root, exec, expect }) => {
+    await exec('pnpm tailwindcss --input src/index.css --output dist/out.css', {
+      cwd: path.join(root, 'project-a'),
+    })
+
+    expect(await fs.dumpFiles('./project-a/dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- ./project-a/dist/out.css ---
+      @layer properties;
+      .content-\\[\\'GOOD-1\\'\\] {
+        --tw-content: 'GOOD-1';
+        content: var(--tw-content);
+      }
+      .content-\\[\\'GOOD-2\\'\\] {
+        --tw-content: 'GOOD-2';
+        content: var(--tw-content);
+      }
+      @property --tw-content {
+        syntax: "*";
+        inherits: false;
+        initial-value: "";
+      }
+      @layer properties {
+        @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
+          *, ::before, ::after, ::backdrop {
+            --tw-content: "";
+          }
+        }
+      }
+      "
+    `)
+  },
+)
+
+test(
+  '@source works with symlinks (referencing sibling project)',
+  {
+    fs: {
+      'package.json': json`{}`,
+      'pnpm-workspace.yaml': yaml`
+        #
+        packages:
+          - project-a
+      `,
+      'project-a/package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'project-a/src/index.css': css`
+        @import 'tailwindcss/utilities' source(none);
+
+        /* Same as the previous test, but using symlinks instead */
+        @source '../../project-b';
+        @source not '../../project-b/ignored';
+        @source '../../project-b/ignored/except.html';
+      `,
+
+      'project-b/keep/keep.html': html`<div class="content-['GOOD-1']"></div>`,
+      'project-c/ignored/ignored.html': html`<div class="content-['BAD-1']"></div>`,
+      'project-c/ignored/except.html': html`<div class="content-['GOOD-2']"></div>`,
+
+      // Symlink the ignored folder to another project
+      'project-b/ignored': 'symlink:../../project-c/ignored/',
+    },
+  },
+  async ({ fs, root, exec, expect }) => {
+    await exec('pnpm tailwindcss --input src/index.css --output dist/out.css', {
+      cwd: path.join(root, 'project-a'),
+    })
+
+    expect(await fs.dumpFiles('./project-a/dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- ./project-a/dist/out.css ---
+      @layer properties;
+      .content-\\[\\'GOOD-1\\'\\] {
+        --tw-content: 'GOOD-1';
+        content: var(--tw-content);
+      }
+      .content-\\[\\'GOOD-2\\'\\] {
+        --tw-content: 'GOOD-2';
+        content: var(--tw-content);
+      }
+      @property --tw-content {
+        syntax: "*";
+        inherits: false;
+        initial-value: "";
+      }
+      @layer properties {
+        @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
+          *, ::before, ::after, ::backdrop {
+            --tw-content: "";
+          }
+        }
+      }
+      "
+    `)
+  },
+)
+
+// https://github.com/tailwindlabs/tailwindcss/issues/19844
+test(
+  '@source scans directories ignored by allow-list .gitignore files',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      '.gitignore': txt`
+        *
+        !/app
+        !/app/design
+        !/app/design/**
+      `,
+      'src/index.css': css`
+        @import 'tailwindcss/utilities' source(none);
+        @source '../vendor/acme/theme';
+      `,
+      // 1. Ignored by the `*` in `.gitignore`
+      // 2. Included by the `!` pattern in `.gitignore`
+      // 3. Ignored by `source(none)`
+      //
+      // → Should be ignored
+      'app/design/frontend/theme/templates/component.phtml': html`
+        <div
+          class="content-['app/design/frontend/theme/templates/component.phtml']"
+        ></div>
+      `,
+      // 1. Ignored by the `*` in `.gitignore`
+      // 2. Included by the `!` pattern in `.gitignore`
+      // 3. Ignored by `source(none)`
+      // 4. Included by the `@source` directive
+      //
+      // → Should be included
+      'vendor/acme/theme/module/templates/component.phtml': html`
+        <div
+          class="content-['vendor/acme/theme/module/templates/component.phtml']"
+        ></div>
+      `,
+    },
+  },
+  async ({ fs, exec }) => {
+    await exec('pnpm tailwindcss --input src/index.css --output dist/out.css')
+
+    // 1. Ignored by the `*` in `.gitignore`
+    // 2. Included by the `!` pattern in `.gitignore`
+    // 3. Ignored by `source(none)`
+    //
+    // → Should be ignored
+    await fs.expectFileNotToContain('dist/out.css', [
+      candidate`content-['app/design/frontend/theme/templates/component.phtml']`,
+    ])
+
+    // 1. Ignored by the `*` in `.gitignore`
+    // 2. Included by the `!` pattern in `.gitignore`
+    // 3. Ignored by `source(none)`
+    // 4. Included by the `@source` directive
+    //
+    // → Should be included
+    await fs.expectFileToContain('dist/out.css', [
+      candidate`content-['vendor/acme/theme/module/templates/component.phtml']`,
+    ])
+  },
+)
+
+test(
+  '@source works with symlinks (referencing folder in current folder)',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'src/index.css': css`
+        @import 'tailwindcss/utilities' source(none);
+
+        /* Same as the previous test, but using symlinks instead */
+        @source '../lib';
+        @source not '../lib/ignored';
+        @source '../lib/ignored/except.html';
+      `,
+
+      'lib/keep/keep.html': html`<div class="content-['GOOD-1']"></div>`,
+      'vendor/ignored/ignored.html': html`<div class="content-['BAD-1']"></div>`,
+      'vendor/ignored/except.html': html`<div class="content-['GOOD-2']"></div>`,
+
+      // Symlink the ignored folder to another folder
+      'lib/ignored': 'symlink:../../vendor/ignored/',
+    },
+  },
+  async ({ fs, exec, expect }) => {
+    await exec('pnpm tailwindcss --input src/index.css --output dist/out.css')
+
+    expect(await fs.dumpFiles('./dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- ./dist/out.css ---
+      @layer properties;
+      .content-\\[\\'GOOD-1\\'\\] {
+        --tw-content: 'GOOD-1';
+        content: var(--tw-content);
+      }
+      .content-\\[\\'GOOD-2\\'\\] {
+        --tw-content: 'GOOD-2';
+        content: var(--tw-content);
+      }
+      @property --tw-content {
+        syntax: "*";
+        inherits: false;
+        initial-value: "";
+      }
+      @layer properties {
+        @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
+          *, ::before, ::after, ::backdrop {
+            --tw-content: "";
+          }
+        }
+      }
+      "
+    `)
+  },
+)
+
+test(
   'auto source detection disabled',
   {
     fs: {
@@ -1677,6 +2639,49 @@ test(
         stdin: '@tailwind utilities;',
       }),
     ).toContain(candidate`flex`)
+  },
+)
+
+test(
+  'suppress output by using the --silent flag',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'index.css': css` @import 'tailwindcss/utilities';`,
+      'index.html': html`<div class="flex"></div>`,
+    },
+  },
+  async ({ fs, exec, expect }) => {
+    let output = await exec('pnpm tailwindcss --input index.css --output dist/loud.css')
+    expect(output).toContain('Done in')
+
+    let silentOutput = await exec(
+      'pnpm tailwindcss --input index.css --output dist/silent.css --silent',
+    )
+    expect(silentOutput).not.toContain('Done in')
+    expect(silentOutput).not.toContain('tailwindcss v')
+
+    expect(await fs.dumpFiles('./dist/*.css')).toMatchInlineSnapshot(`
+      "
+      --- ./dist/loud.css ---
+      .flex {
+        display: flex;
+      }
+
+
+      --- ./dist/silent.css ---
+      .flex {
+        display: flex;
+      }
+      "
+    `)
   },
 )
 
@@ -2039,6 +3044,33 @@ test(
       }
       "
     `)
+  },
+)
+
+test(
+  'CSS parse errors should include filename and line number',
+  {
+    fs: {
+      'package.json': json`
+        {
+          "dependencies": {
+            "tailwindcss": "workspace:^",
+            "@tailwindcss/cli": "workspace:^"
+          }
+        }
+      `,
+      'input.css': txt`
+        .test {
+          color: red;
+          */
+        }
+      `,
+    },
+  },
+  async ({ exec, expect }) => {
+    await expect(exec('pnpm tailwindcss --input input.css --output dist/out.css')).rejects.toThrow(
+      /CssSyntaxError: .*input.css:3:3: Invalid declaration: `\*\/`/,
+    )
   },
 )
 

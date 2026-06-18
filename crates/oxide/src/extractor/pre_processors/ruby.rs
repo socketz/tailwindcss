@@ -34,51 +34,126 @@ impl PreProcessor for Ruby {
 
         // Extract embedded template languages
         // https://viewcomponent.org/guide/templates.html#interpolations
-        let content_as_str = std::str::from_utf8(content).unwrap();
+        // Only process if content is valid UTF-8, otherwise skip HEREDOC extraction
+        // but still perform the byte-level Ruby processing below
+        if let Ok(content_as_str) = std::str::from_utf8(content) {
+            let starts = TEMPLATE_START_REGEX
+                .captures_iter(content_as_str)
+                .collect::<Vec<_>>();
+            let ends = TEMPLATE_END_REGEX
+                .captures_iter(content_as_str)
+                .collect::<Vec<_>>();
 
-        let starts = TEMPLATE_START_REGEX
-            .captures_iter(content_as_str)
-            .collect::<Vec<_>>();
-        let ends = TEMPLATE_END_REGEX
-            .captures_iter(content_as_str)
-            .collect::<Vec<_>>();
+            for start in starts.iter() {
+                // The language for this block
+                let lang = start.get(1).unwrap().as_str();
 
-        for start in starts.iter() {
-            // The language for this block
-            let lang = start.get(1).unwrap().as_str();
+                // The HEREDOC delimiter
+                let delimiter_start = start.get(2).unwrap().as_str();
 
-            // The HEREDOC delimiter
-            let delimiter_start = start.get(2).unwrap().as_str();
+                // Where the "body" starts for the HEREDOC block
+                let body_start = start.get(0).unwrap().end();
 
-            // Where the "body" starts for the HEREDOC block
-            let body_start = start.get(0).unwrap().end();
+                // Look through all of the ends to find a matching language
+                for end in ends.iter() {
+                    // 1. This must appear after the start
+                    let body_end = end.get(0).unwrap().start();
+                    if body_end < body_start {
+                        continue;
+                    }
 
-            // Look through all of the ends to find a matching language
-            for end in ends.iter() {
-                // 1. This must appear after the start
-                let body_end = end.get(0).unwrap().start();
-                if body_end < body_start {
-                    continue;
+                    // The languages must match otherwise we haven't found the end
+                    let delimiter_end = end.get(1).unwrap().as_str();
+                    if delimiter_end != delimiter_start {
+                        continue;
+                    }
+
+                    let body = &content_as_str[body_start..body_end];
+                    let replaced =
+                        pre_process_input(body.as_bytes().to_vec(), &lang.to_ascii_lowercase());
+
+                    result.replace_range(body_start..body_end, replaced);
+                    break;
                 }
-
-                // The languages must match otherwise we haven't found the end
-                let delimiter_end = end.get(1).unwrap().as_str();
-                if delimiter_end != delimiter_start {
-                    continue;
-                }
-
-                let body = &content_as_str[body_start..body_end];
-                let replaced = pre_process_input(body.as_bytes(), &lang.to_ascii_lowercase());
-
-                result.replace_range(body_start..body_end, replaced);
-                break;
             }
         }
 
         // Ruby extraction
         while cursor.pos < len {
-            // Looking for `%w` or `%W`
-            if cursor.curr != b'%' && !matches!(cursor.next, b'w' | b'W') {
+            match cursor.curr() {
+                b'"' => {
+                    cursor.advance();
+
+                    while cursor.pos < len {
+                        match cursor.curr() {
+                            // Escaped character, skip ahead to the next character
+                            b'\\' => cursor.advance_twice(),
+
+                            // End of the string
+                            b'"' => break,
+
+                            // Everything else is valid
+                            _ => cursor.advance(),
+                        };
+                    }
+
+                    cursor.advance();
+                    continue;
+                }
+
+                b'\'' => {
+                    cursor.advance();
+
+                    while cursor.pos < len {
+                        match cursor.curr() {
+                            // Escaped character, skip ahead to the next character
+                            b'\\' => cursor.advance_twice(),
+
+                            // End of the string
+                            b'\'' => break,
+
+                            // Everything else is valid
+                            _ => cursor.advance(),
+                        };
+                    }
+
+                    cursor.advance();
+                    continue;
+                }
+
+                // Replace comments in Ruby files
+                //
+                // Except for strict locals, these are defined in a `<%# locals: … %>`. Checking if
+                // the comment is preceded by a `%` should be enough without having to perform more
+                // parsing logic. Worst case we _do_ scan a few comments.
+                //
+                // We also want to skip interpolation syntax, which look like `#{…}`.
+                b'#' if !matches!(cursor.prev(), b'%') && !matches!(cursor.next(), b'{') => {
+                    result[cursor.pos] = b' ';
+                    cursor.advance();
+
+                    while cursor.pos < len {
+                        match cursor.curr() {
+                            // End of the comment
+                            b'\n' => break,
+
+                            // Everything else is part of the comment and replaced
+                            _ => {
+                                result[cursor.pos] = b' ';
+                                cursor.advance();
+                            }
+                        };
+                    }
+
+                    cursor.advance();
+                    continue;
+                }
+
+                _ => {}
+            }
+
+            // Looking for `%w`, `%W`, or `%p`
+            if cursor.curr() != b'%' || !matches!(cursor.next(), b'w' | b'W' | b'p') {
                 cursor.advance();
                 continue;
             }
@@ -86,10 +161,12 @@ impl PreProcessor for Ruby {
             cursor.advance_twice();
 
             // Boundary character
-            let boundary = match cursor.curr {
+            let boundary = match cursor.curr() {
                 b'[' => b']',
                 b'(' => b')',
                 b'{' => b'}',
+                b'#' => b'#',
+                b' ' => b'\n',
                 _ => {
                     cursor.advance();
                     continue;
@@ -105,11 +182,11 @@ impl PreProcessor for Ruby {
             cursor.advance();
 
             while cursor.pos < len {
-                match cursor.curr {
+                match cursor.curr() {
                     // Skip escaped characters
                     b'\\' => {
                         // Use backslash to embed spaces in the strings.
-                        if cursor.next == b' ' {
+                        if cursor.next() == b' ' {
                             result[cursor.pos] = b' ';
                         }
 
@@ -118,20 +195,23 @@ impl PreProcessor for Ruby {
 
                     // Start of a nested bracket
                     b'[' | b'(' | b'{' => {
-                        bracket_stack.push(cursor.curr);
+                        bracket_stack.push(cursor.curr());
                     }
 
                     // End of a nested bracket
                     b']' | b')' | b'}' if !bracket_stack.is_empty() => {
-                        if !bracket_stack.pop(cursor.curr) {
+                        if !bracket_stack.pop(cursor.curr()) {
                             // Unbalanced
                             cursor.advance();
                         }
                     }
 
                     // End of the pattern, replace the boundary character with a space
-                    _ if cursor.curr == boundary => {
-                        result[cursor.pos] = b' ';
+                    _ if cursor.curr() == boundary => {
+                        if boundary != b'\n' {
+                            result[cursor.pos] = b' ';
+                        }
+
                         break;
                     }
 
@@ -173,12 +253,51 @@ mod tests {
                 "%w(flex data-[state=pending]:bg-(--my-color) flex-col)",
                 "%w flex data-[state=pending]:bg-(--my-color) flex-col ",
             ),
+
+            // %w …\n
+            ("%w flex px-2.5\n", "%w flex px-2.5\n"),
+
             // Use backslash to embed spaces in the strings.
             (r#"%w[foo\ bar baz\ bat]"#, r#"%w foo  bar baz  bat "#),
             (r#"%W[foo\ bar baz\ bat]"#, r#"%W foo  bar baz  bat "#),
+
             // The nested delimiters evaluated to a flat array of strings
             // (not nested array).
             (r#"%w[foo[bar baz]qux]"#, r#"%w foo[bar baz]qux "#),
+
+            (
+              "# test\n# test\n# {ActiveRecord::Base#save!}[rdoc-ref:Persistence#save!]\n%w[flex px-2.5]",
+              "      \n      \n                                                        \n%w flex px-2.5 "
+            ),
+
+            (r#""foo # bar""#, r#""foo # bar""#),
+            (r#"'foo # bar'"#, r#"'foo # bar'"#),
+            (
+              r#"def call = tag.span "Foo", class: %w[rounded-full h-0.75 w-0.75]"#,
+              r#"def call = tag.span "Foo", class: %w rounded-full h-0.75 w-0.75 "#
+            ),
+
+            (r#"%w[foo ' bar]"#, r#"%w foo ' bar "#),
+            (r#"%w[foo " bar]"#, r#"%w foo " bar "#),
+            (r#"%W[foo ' bar]"#, r#"%W foo ' bar "#),
+            (r#"%W[foo " bar]"#, r#"%W foo " bar "#),
+
+            (r#"%p foo ' bar "#, r#"%p foo ' bar "#),
+            (r#"%p foo " bar "#, r#"%p foo " bar "#),
+
+            (
+              "%p has a ' quote\n# this should be removed\n%p has a ' quote",
+              "%p has a ' quote\n                        \n%p has a ' quote"
+            ),
+            (
+              "%p has a \" quote\n# this should be removed\n%p has a \" quote",
+              "%p has a \" quote\n                        \n%p has a \" quote"
+            ),
+
+            (
+              "%w#this text is kept# # this text is not",
+              "%w this text is kept                    ",
+            ),
         ] {
             Ruby::test(input, expected);
         }
@@ -211,6 +330,16 @@ mod tests {
                 "%w(flex data-[state=pending]:bg-(--my-color) flex-col)",
                 vec!["flex", "data-[state=pending]:bg-(--my-color)", "flex-col"],
             ),
+
+            (
+              "# test\n# test\n# {ActiveRecord::Base#save!}[rdoc-ref:Persistence#save!]\n%w[flex px-2.5]",
+              vec!["flex", "px-2.5"],
+            ),
+
+            (r#""foo # bar""#, vec!["foo", "bar"]),
+            (r#"'foo # bar'"#, vec!["foo", "bar"]),
+
+            (r#"%w[foo ' bar]"#, vec!["foo", "bar"]),
         ] {
             Ruby::test_extract_contains(input, expected);
         }
@@ -261,5 +390,80 @@ mod tests {
             end
         "#;
         Ruby::test_extract_contains(input, vec!["z-1", "z-2", "z-3"]);
+    }
+
+    // https://github.com/tailwindlabs/tailwindcss/issues/19728
+    #[test]
+    fn test_interpolated_expressions() {
+        let input = r#"
+            def width_class(width = nil)
+              <<~STYLE_CLASS
+                #{width || 'w-100'}
+              STYLE_CLASS
+            end
+        "#;
+
+        Ruby::test_extract_contains(input, vec!["w-100"]);
+    }
+
+    // https://github.com/tailwindlabs/tailwindcss/issues/19239
+    #[test]
+    fn test_skip_comments() {
+        let input = r#"
+          # From activerecord-8.1.1/lib/active_record/errors.rb:147
+          # Rails uses RDoc cross-reference syntax in inline documentation:
+          # {ActiveRecord::Base#save!}[rdoc-ref:Persistence#save!]
+        "#;
+
+        // Nothing should be extracted from comments, so expect an empty array.
+        Ruby::test_extract_exact(input, vec![]);
+    }
+
+    // https://github.com/tailwindlabs/tailwindcss/issues/19481
+    #[test]
+    fn test_strict_locals() {
+        // Strict locals are defined in a `<%# locals: … %>`, but the `#` looks like a comment
+        // which we should not ignore in this case.
+        let input = r#"
+          <%# locals: (css: "text-amber-600") %>
+          <% more_css = "text-sky-500" %>
+
+          <p class="text-green-500">
+            In a partial
+          </p>
+
+          <p class="<%= css %>">
+            In a partial using explicit local variables
+          </p>
+
+          <p class="<%= more_css %>">
+            In a partial using explicit local variables
+          </p>
+        "#;
+
+        Ruby::test_extract_contains(
+            input,
+            vec!["text-amber-600", "text-sky-500", "text-green-500"],
+        );
+    }
+
+    #[test]
+    fn test_invalid_utf8_does_not_panic() {
+        // Invalid UTF-8 sequence: 0x80 is a continuation byte without a leading byte
+        let invalid_utf8: &[u8] = &[0x80, 0x81, 0x82];
+
+        let processor = Ruby::default();
+
+        // Should not panic, just return the input unchanged
+        let result = processor.process(invalid_utf8);
+        assert_eq!(result, invalid_utf8);
+    }
+
+    #[test]
+    fn test_valid_utf8_with_multibyte_chars() {
+        // Test that valid UTF-8 with multi-byte characters (like em-dashes) works
+        let input = "# Comment with em—dash\n%w[flex px-2.5]";
+
+        Ruby::test_extract_contains(input, vec!["flex", "px-2.5"]);
     }
 }

@@ -1,8 +1,9 @@
 import { Features } from '..'
-import { styleRule, toCss, walk, WalkAction, type AstNode } from '../ast'
+import { cssContext, styleRule, toCss, type AstNode } from '../ast'
 import type { DesignSystem } from '../design-system'
 import type { SourceLocation } from '../source-maps/source'
 import { segment } from '../utils/segment'
+import { walk, WalkAction } from '../walk'
 import { applyConfigToTheme } from './apply-config-to-theme'
 import { applyKeyframesToTheme } from './apply-keyframes-to-theme'
 import { createCompatConfig } from './config/create-compat-config'
@@ -50,12 +51,13 @@ export async function applyCompatibilityHooks({
     src: SourceLocation | undefined
   }[] = []
 
-  walk(ast, (node, { parent, replaceWith, context }) => {
+  walk(ast, (node, _ctx) => {
     if (node.kind !== 'at-rule') return
+    let ctx = cssContext(_ctx)
 
     // Collect paths from `@plugin` at-rules
     if (node.name === '@plugin') {
-      if (parent !== null) {
+      if (ctx.parent !== null) {
         throw new Error('`@plugin` cannot be nested.')
       }
 
@@ -110,16 +112,15 @@ export async function applyCompatibilityHooks({
       pluginPaths.push([
         {
           id: pluginPath,
-          base: context.base as string,
-          reference: !!context.reference,
+          base: ctx.context.base as string,
+          reference: !!ctx.context.reference,
           src: node.src,
         },
         Object.keys(options).length > 0 ? options : null,
       ])
 
-      replaceWith([])
       features |= Features.JsPluginCompat
-      return
+      return WalkAction.Replace([])
     }
 
     // Collect paths from `@config` at-rules
@@ -128,19 +129,18 @@ export async function applyCompatibilityHooks({
         throw new Error('`@config` cannot have a body.')
       }
 
-      if (parent !== null) {
+      if (ctx.parent !== null) {
         throw new Error('`@config` cannot be nested.')
       }
 
       configPaths.push({
         id: node.params.slice(1, -1),
-        base: context.base as string,
-        reference: !!context.reference,
+        base: ctx.context.base as string,
+        reference: !!ctx.context.reference,
         src: node.src,
       })
-      replaceWith([])
       features |= Features.JsPluginCompat
-      return
+      return WalkAction.Replace([])
     }
   })
 
@@ -309,15 +309,29 @@ function upgradeToFullPluginSupport({
 
     let resolvedValue = sharedPluginApi.theme(path, undefined)
 
+    // When a tuple is returned, return the first element
     if (Array.isArray(resolvedValue) && resolvedValue.length === 2) {
-      // When a tuple is returned, return the first element
       return resolvedValue[0]
-    } else if (Array.isArray(resolvedValue)) {
-      // Arrays get serialized into a comma-separated lists
+    }
+
+    // Arrays get serialized into a comma-separated lists
+    else if (Array.isArray(resolvedValue)) {
       return resolvedValue.join(', ')
-    } else if (typeof resolvedValue === 'string') {
-      // Otherwise only allow string values here, objects (and namespace maps)
-      // are treated as non-resolved values for the CSS `theme()` function.
+    }
+
+    // If we're dealing with an object that has the `DEFAULT` key, return the
+    // default value
+    else if (
+      typeof resolvedValue === 'object' &&
+      resolvedValue !== null &&
+      'DEFAULT' in resolvedValue
+    ) {
+      return resolvedValue.DEFAULT
+    }
+
+    // Otherwise only allow string values here, objects (and namespace maps)
+    // are treated as non-resolved values for the CSS `theme()` function.
+    else if (typeof resolvedValue === 'string') {
       return resolvedValue
     }
   }
@@ -339,7 +353,7 @@ function upgradeToFullPluginSupport({
   // config would otherwise expand into namespaces like `background-color` which
   // core utilities already read from.
   applyConfigToTheme(designSystem, resolvedUserConfig, replacedThemeKeys)
-  applyKeyframesToTheme(designSystem, resolvedUserConfig, replacedThemeKeys)
+  applyKeyframesToTheme(designSystem, resolvedUserConfig)
 
   registerThemeVariantOverrides(resolvedUserConfig, designSystem)
   registerScreensConfig(resolvedUserConfig, designSystem)
@@ -372,18 +386,18 @@ function upgradeToFullPluginSupport({
   if (typeof resolvedConfig.important === 'string') {
     let wrappingSelector = resolvedConfig.important
 
-    walk(ast, (node, { replaceWith, parent }) => {
+    walk(ast, (node, _ctx) => {
       if (node.kind !== 'at-rule') return
       if (node.name !== '@tailwind' || node.params !== 'utilities') return
 
+      let ctx = cssContext(_ctx)
+
       // The AST node was already manually wrapped so there's nothing to do
-      if (parent?.kind === 'rule' && parent.selector === wrappingSelector) {
+      if (ctx.parent?.kind === 'rule' && ctx.parent.selector === wrappingSelector) {
         return WalkAction.Stop
       }
 
-      replaceWith(styleRule(wrappingSelector, [node]))
-
-      return WalkAction.Stop
+      return WalkAction.ReplaceStop(styleRule(wrappingSelector, [node]))
     })
   }
 
