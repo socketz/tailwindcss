@@ -5247,10 +5247,6 @@ snapshots:
     dependencies:
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  magic-string@0.30.21:
-    dependencies:
-      '@jridgewell/sourcemap-codec': 1.5.5
-
   merge-stream@2.0.0: {}
 
   merge2@1.4.1: {}

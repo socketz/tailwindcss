@@ -32,13 +32,6 @@
     }
   },
   "license": "MIT",
-<<<<<<< HEAD
-  "dependencies": {
-    "tar": "^7.5.11",
-    "detect-libc": "^2.0.4"
-  },
-=======
->>>>>>> c46f654fa0039ad4741c6ecefbe4e2a208a665c3
   "devDependencies": {
     "@napi-rs/cli": "3.7.0",
     "@napi-rs/wasm-runtime": "^1.1.5",
